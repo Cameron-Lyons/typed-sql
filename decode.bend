@@ -56,14 +56,21 @@ def nullable(-A: Data, parse: String -> Checked(A), name: String, cell: R.Cell) 
         x : A <- named(A, name, parse(s))
         return Some{x}
 
+def prepend(-A: Data, result: Checked(A), acc: List<&2, A>) -> Checked(List<&2, A>):
+  match result:
+    case Fail{err}: Fail{err}
+    case Done{x}: Done{x <> acc}
+
+# Tail recursion also keeps large result sets off the JavaScript call stack.
+def read_rows_into(~A: Data, ~read_row: R.Row -> Checked(A), rows: R.Rows, result: Checked(List<&2, A>)) -> Checked(List<&2, A>):
+  match rows result:
+    case _ Fail{err}: Fail{err}
+    case Nil{} Done{acc}: Done{List.reverse(&2, A, acc)}
+    case row <> tail Done{acc}:
+      read_rows_into(~A, ~read_row, tail, prepend(A, read_row(row), acc))
+
 def read_rows(~A: Data, ~read_row: R.Row -> Checked(A), rows: R.Rows) -> Checked(List<&2, A>):
-  match rows:
-    case Nil{}: Done{Nil{}}
-    case row <> tail:
-      do Result<&2, &2, String, List<&2, A>>:
-        first : A <- read_row(row)
-        rest : List<&2, A> <- read_rows(~A, ~read_row, tail)
-        return first <> rest
+  read_rows_into(~A, ~read_row, rows, Done{Nil{}})
 
 def decoded(-A: Data, db: R.Db, name: String, result: Checked(A)) -> R.Outcome<A>:
   match result:

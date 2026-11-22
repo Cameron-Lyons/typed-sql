@@ -51,10 +51,11 @@ Use `BIGINT` for the full signed 64-bit range on both databases. PostgreSQL enfo
 
 - Supply a schema snapshot containing `CREATE TABLE` statements. The checker understands column-level `PRIMARY KEY`, `UNIQUE`, `NULL`, and `NOT NULL`. Put explicit `NOT NULL` on primary keys other than SQLite's special `INTEGER PRIMARY KEY`. When an `ALTER TABLE` migration changes a column, update the snapshot used for generation.
 - Use single-table `SELECT`, `INSERT INTO … (columns) VALUES (values)`, `UPDATE … SET`, or `DELETE FROM`. Projections accept column names, `AS` aliases, and `*`. Writes can include `RETURNING`. A query with result columns returns a list of typed rows, and a write without result columns returns `Unit`.
-- A `WHERE` clause accepts comparisons with literals or named parameters, `IS NULL`, `IS NOT NULL`, and `AND`. Repeated parameter names share a binding. Incompatible types, missing required insert columns, unknown names, ambiguous output names, and unsupported SQL fail the check. Joins, aggregates, subqueries, ordering, and dialect-specific expressions are outside the checked grammar.
+- A `WHERE` clause accepts comparisons with literals or named parameters, `IS NULL`, `IS NOT NULL`, and `AND`. Repeated parameter names share a binding. Incompatible types, missing required insert columns, unknown names, ambiguous output names, and unsupported SQL fail the check. Joins, aggregates, subqueries, and dialect-specific expressions are outside the checked grammar.
+- A `SELECT` can sort by one or more columns or output aliases and take a page, for example `SELECT id AS book_id, title FROM books ORDER BY title ASC, book_id DESC LIMIT 20 OFFSET 40`. An output alias takes precedence over a source column of the same name. Both engines sort integers numerically and put NULLs last for ascending order and first for descending order. Use `NULLS FIRST` or `NULLS LAST` to choose explicitly. `LIMIT` and its optional `OFFSET` accept nonnegative integer literals up to 9223372036854775807.
 - Use ASCII unquoted identifiers of up to 63 characters. Query filenames follow the same identifier shape. SQL identifiers and parameter names fold to lowercase. Use single quotes with doubled apostrophes for SQL strings. Parameters can carry arbitrary supported text without literal escaping.
 
-Generation checks the entire query directory before replacing the output module. The default library directory is the directory containing the CLI. If you install the binary elsewhere, pass the directory containing `runtime.bend` and `decode.bend` as the last argument. Generated imports are relative to the output file.
+Generation checks the SQL files and library paths before replacing the output module. The CLI uses the POSIX shell and `realpath` to resolve the installed executable and directories, including symlinks. By default it looks for `runtime.bend` and `decode.bend` beside the executable. If you install the binary separately, pass the library directory as the last argument. Generated imports are relative to the output file. Choose a Bend module filename such as `generated.bend`. Each name in its import path must begin with an ASCII letter or underscore and may also contain digits and hyphens.
 
 ```sh
 typed-sql generate schema.sql queries generated.bend /path/to/typed-sql
@@ -85,9 +86,10 @@ bend tests/checker.bend
 bend tests/decode.bend
 bend tests/runtime.bend
 bend tests/migrations.bend
+sh tests/cli.sh
 ```
 
-To exercise the runtime against a local PostgreSQL instance configured for passwordless access, run `bend tests/runtime.bend PORT USER DATABASE`. The test uses a temporary table.
+To exercise PostgreSQL on a local instance configured for passwordless access, run `bend tests/runtime.bend PORT USER DATABASE` and `bend tests/migrations.bend PORT USER DATABASE`. Both use session-local test tables.
 
 ## License
 

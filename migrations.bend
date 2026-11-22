@@ -27,10 +27,8 @@ def checked(-A: Data, r: M.Checked(A)) -> Action(A):
 def execute(sqlite: String, pg: String, params: R.Row, width: U32) -> Action(R.Rows):
   db => R.run(db, sqlite, pg, params, width)
 
-def command(+sql: String) -> Action(Unit):
-  do Action<Unit>:
-    _ : R.Rows <- execute(sql, sql, Nil{}, 0)
-    return Unit{}
+def command(sql: String) -> Action(Unit):
+  db => R.discard(db, sql)
 
 def statements(xs: S.Strings) -> Action(Unit):
   match xs:

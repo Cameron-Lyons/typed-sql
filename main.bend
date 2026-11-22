@@ -12,49 +12,57 @@ import ./migrations.bend as Mig
 def Queries() -> Data:
   List<&2, M.Query>
 
-def read_queries(names: F.Strings, +dir: String, +tables: M.Schema) -> IO(Queries):
+def read_queries(~A: Data, ~collect: A -> String -> C.Plan -> A,
+  names: F.Strings, +dir: String, +tables: M.Schema, acc: A) -> IO(A):
   match names:
-    case Nil{}: IO.pure(Queries, Nil{})
-    case +name <> rest:
-      do IO<Queries>:
-        +path : String = Fs.path.join(dir, name)
+    case Nil{}: IO.pure(A, acc)
+    case +filename <> rest:
+      do IO<A>:
+        +path : String = Fs.path.join(dir, filename)
+        +name : String = F.stem(filename)
         sql : String <- F.read(path)
-        q : M.Query <- F.checked(M.Query, path, C.query(tables, F.stem(name), sql))
-        tail : Queries <- read_queries(rest, dir, tables)
-        return q <> tail
+        plan : C.Plan <- F.checked(C.Plan, path, C.analyze(tables, name, sql))
+        read_queries(~A, ~collect, rest, dir, tables, collect(acc, name, plan))
 
-def load_queries(+schema: String, +dir: String) -> IO(Queries):
-  do IO<Queries>:
+def load_queries(~A: Data, ~collect: A -> String -> C.Plan -> A,
+  +schema: String, +dir: String, initial: A) -> IO(A):
+  do IO<A>:
     ddl : String <- F.read(schema)
     tables : M.Schema <- F.checked(M.Schema, schema, C.schema(ddl))
     +names : F.Strings <- F.sql_files(dir)
     F.checked(Unit, dir, S.require(Bool.not(List.is_empty(&2, String, names)), "no .sql query files"))
-    read_queries(names, dir, tables)
+    read_queries(~A, ~collect, names, dir, tables, initial)
+
+def count_query(n: Nat, name: String, plan: C.Plan) -> Nat:
+  Succ{n}
+
+def collect_query(acc: Queries, name: String, plan: C.Plan) -> Queries:
+  C.checked(name, plan) <> acc
 
 def check_cmd(schema: String, dir: String) -> IO(Unit):
   do IO<Unit>:
-    qs : Queries <- load_queries(schema, dir)
-    IO.print("Checked " ++ Nat.show(List.length(&2, M.Query, qs)) ++ " queries.")
+    count : Nat <- load_queries(~Nat, ~count_query, schema, dir, 0n)
+    IO.print("Checked " ++ Nat.show(count) ++ " queries.")
 
-def generate_cmd(schema: String, dir: String, +out: String, lib: String) -> IO(Unit):
+def generate_cmd(schema: String, dir: String, +out: String, library: IO(String)) -> IO(Unit):
   do IO<Unit>:
-    F.checked(Unit, out, S.require(String.ends_with(out, ".bend"), "expected a .bend output file"))
-    qs : Queries <- load_queries(schema, dir)
-    cwd : String <- IO.try(String, IO.get_env("PWD"))
-    +prefix : String <- F.checked(String, out, F.library_dir(cwd, lib, out))
+    F.checked(Unit, out, S.require(F.valid_output(out), "expected an importable .bend output filename"))
+    reversed : Queries <- load_queries(~Queries, ~collect_query, schema, dir, Nil{})
+    qs : Queries = List.reverse(&2, M.Query, reversed)
+    lib : String <- library
+    +prefix : String <- F.library_prefix(out, lib)
     F.replace(out, G.emit(qs, prefix ++ "runtime.bend", prefix ++ "decode.bend"))
     IO.print("Generated " ++ out)
 
-def read_migrations(names: F.Strings, +dir: String) -> IO(S.History):
+def read_migrations(names: F.Strings, +dir: String, acc: S.History) -> IO(S.History):
   match names:
-    case Nil{}: IO.pure(S.History, Nil{})
+    case Nil{}: IO.pure(S.History, acc)
     case +name <> tail:
       do IO<S.History>:
         +path : String = Fs.path.join(dir, name)
         source : String <- F.read(path)
         m : S.Migration <- F.checked(S.Migration, path, S.parse(name, source))
-        more : S.History <- read_migrations(tail, dir)
-        return m <> more
+        read_migrations(tail, dir, m <> acc)
 
 def migrated(r: R.Outcome<U32>) -> IO(Unit):
   match r:
@@ -79,7 +87,7 @@ def with_db(r: Result<&1, &1, String, R.Db>, ms: S.History) -> IO(Unit):
 def migrate(+dir: String, open_db: IO(Result<&1, &1, String, R.Db>)) -> IO(Unit):
   do IO<Unit>:
     names : F.Strings <- F.sql_files(dir)
-    ms : S.History <- read_migrations(names, dir)
+    ms : S.History <- read_migrations(names, dir, Nil{})
     r : Result<&1, &1, String, R.Db> <- open_db
     with_db(r, ms)
 
@@ -99,6 +107,12 @@ def ssl_mode(mode: String) -> M.Checked(Bool):
     case "disable": Done{False{}}
     case _: Fail{"expected verify-full or disable"}
 
+def tcp_port(parsed: Maybe<&2, U32>) -> M.Checked(U32):
+  match parsed:
+    case Some{+n}: Bool.pick(M.Checked(U32), U32.is_gt(n, 0) && U32.is_le(n, 65535),
+      Done{n}, Fail{"expected a TCP port from 1 to 65535"})
+    case None{}: Fail{"expected a TCP port from 1 to 65535"}
+
 def pg_open() -> IO(Result<&1, &1, String, R.Db>):
   do IO<Result<&1, &1, String, R.Db>>:
     host : String <- env("PGHOST", "localhost")
@@ -106,8 +120,7 @@ def pg_open() -> IO(Result<&1, &1, String, R.Db>):
     database : String <- env("PGDATABASE", user)
     password : String <- env("PGPASSWORD", "")
     number : String <- env("PGPORT", "5432")
-    +port : U32 <- F.checked(U32, "PGPORT", S.decimal(number, 0))
-    F.checked(Unit, "PGPORT", S.require(U32.is_gt(port, 0) && U32.is_le(port, 65535), "expected a TCP port from 1 to 65535"))
+    port : U32 <- F.checked(U32, "PGPORT", tcp_port(U32.read(number)))
     mode : String <- env("PGSSLMODE", "verify-full")
     tls : Bool <- F.checked(Bool, "PGSSLMODE", ssl_mode(mode))
     R.open_postgres(Pg.Config{host, port, tls, user, password, database, 10000})
@@ -123,8 +136,8 @@ def dispatch(args: List<String>) -> IO(Unit):
     case _ <> "--help" <> Nil{}: IO.print(usage)
     case _ <> "help" <> Nil{}: IO.print(usage)
     case _ <> "check" <> schema <> dir <> Nil{}: check_cmd(schema, dir)
-    case path <> "generate" <> schema <> dir <> out <> Nil{}: generate_cmd(schema, dir, out, Fs.path.parent(path))
-    case _ <> "generate" <> schema <> dir <> out <> lib <> Nil{}: generate_cmd(schema, dir, out, lib)
+    case path <> "generate" <> schema <> dir <> out <> Nil{}: generate_cmd(schema, dir, out, F.default_library(path))
+    case _ <> "generate" <> schema <> dir <> out <> lib <> Nil{}: generate_cmd(schema, dir, out, IO.pure(String, lib))
     case _ <> "migrate" <> "sqlite" <> path <> dir <> Nil{}: migrate(dir, R.open_sqlite(path))
     case _ <> "migrate" <> "postgres" <> dir <> Nil{}: migrate(dir, pg_open)
     case _: IO.die(Unit, 2, usage)

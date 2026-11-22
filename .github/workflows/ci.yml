@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Bend tests (SQLite and PostgreSQL)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    env:
+      CC: clang-22
+      BEND_NO_TELEMETRY: '1'
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Bend 2.0.40
+        working-directory: ${{ runner.temp }}
+        run: |
+          archive=bend-2.0.40-linux-x64.tar.gz
+          curl -fsSL --retry 3 -o "$archive" "https://github.com/bendlang/bend/releases/download/v2.0.40/$archive"
+          echo "c9ff8d67bd903fb6ad9a26b43d8a62c01021de82a44d55ce4a3dcd4732113d6b  $archive" | sha256sum --check --strict
+          mkdir -p "$HOME/.bend"
+          tar -xzf "$archive" -C "$HOME/.bend" --strip-components=1
+          echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
+
+      - name: Test checker and decoder
+        run: |
+          bend tests/checker.bend
+          bend tests/decode.bend
+          bend tests/decode.bend -o "$RUNNER_TEMP/decode.js"
+          node "$RUNNER_TEMP/decode.js"
+
+      - name: Test runtime and migrations on both databases
+        env:
+          TEST_PG_PORT: ${{ job.services.postgres.ports[5432] }}
+        run: |
+          for suite in runtime migrations; do
+            bend "tests/$suite.bend" -o "$RUNNER_TEMP/$suite"
+            "$RUNNER_TEMP/$suite"
+            "$RUNNER_TEMP/$suite" "$TEST_PG_PORT" postgres postgres
+          done
+
+      - name: Test CLI and generated SQLite caller
+        run: sh tests/cli.sh
