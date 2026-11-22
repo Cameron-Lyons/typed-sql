@@ -44,15 +44,26 @@ def check_cmd(schema: String, dir: String) -> IO(Unit):
     count : Nat <- load_queries(~Nat, ~count_query, schema, dir, 0n)
     IO.print("Checked " ++ Nat.show(count) ++ " queries.")
 
-def generate_cmd(schema: String, dir: String, +out: String, library: IO(String)) -> IO(Unit):
+def generated(+out: String, contents: String, verify: Bool) -> IO(Unit):
+  match verify:
+    case True{}:
+      do IO<Unit>:
+        existing : String <- F.read(out)
+        F.checked(Unit, out, S.require(String.eq(existing, contents), "generated module is out of date; regenerate it"))
+        IO.print("Verified " ++ out)
+    case False{}:
+      do IO<Unit>:
+        F.replace(out, contents)
+        IO.print("Generated " ++ out)
+
+def generate_cmd(schema: String, dir: String, +out: String, library: IO(String), verify: Bool) -> IO(Unit):
   do IO<Unit>:
     F.checked(Unit, out, S.require(F.valid_output(out), "expected an importable .bend output filename"))
     reversed : Queries <- load_queries(~Queries, ~collect_query, schema, dir, Nil{})
     qs : Queries = List.reverse(&2, M.Query, reversed)
     lib : String <- library
     +prefix : String <- F.library_prefix(out, lib)
-    F.replace(out, G.emit(qs, prefix ++ "runtime.bend", prefix ++ "decode.bend"))
-    IO.print("Generated " ++ out)
+    generated(out, G.emit(qs, prefix ++ "runtime.bend", prefix ++ "decode.bend"), verify)
 
 def read_migrations(names: F.Strings, +dir: String, acc: S.History) -> IO(S.History):
   match names:
@@ -88,8 +99,9 @@ def migrate(+dir: String, open_db: IO(Result<&1, &1, String, R.Db>)) -> IO(Unit)
   do IO<Unit>:
     names : F.Strings <- F.sql_files(dir)
     ms : S.History <- read_migrations(names, dir, Nil{})
+    ordered : S.History <- F.checked(S.History, dir, S.ordered(ms))
     r : Result<&1, &1, String, R.Db> <- open_db
-    with_db(r, ms)
+    with_db(r, ordered)
 
 def env_value(r: Result<&1, &1, U32 & String, String>, fallback: String) -> String:
   match r:
@@ -127,19 +139,67 @@ def pg_open() -> IO(Result<&1, &1, String, R.Db>):
 
 def usage() -> String:
   "typed-sql check SCHEMA.sql QUERY_DIR\n"
-    ++ "typed-sql generate SCHEMA.sql QUERY_DIR OUTPUT.bend [LIB_DIR]\n"
+    ++ "typed-sql generate [--check] SCHEMA.sql QUERY_DIR OUTPUT.bend [LIB_DIR]\n"
     ++ "typed-sql migrate sqlite DATABASE MIGRATION_DIR\n"
-    ++ "typed-sql migrate postgres MIGRATION_DIR"
+    ++ "typed-sql migrate postgres MIGRATION_DIR\n\n"
+    ++ "generate --check verifies that OUTPUT.bend is current without changing it."
+
+def help_args(args: List<String>) -> IO(Unit):
+  match args:
+    case Nil{}: IO.print(usage)
+    case _: IO.die(Unit, 2, usage)
+
+def check_args(args: List<String>) -> IO(Unit):
+  match args:
+    case [schema, dir]: check_cmd(schema, dir)
+    case _: IO.die(Unit, 2, usage)
+
+def generate_args(program: String, args: List<String>, verify: Bool) -> IO(Unit):
+  match args:
+    case [schema, dir, out]: generate_cmd(schema, dir, out, F.default_library(program), verify)
+    case [schema, dir, out, lib]: generate_cmd(schema, dir, out, IO.pure(String, lib), verify)
+    case _: IO.die(Unit, 2, usage)
+
+def generate_options(program: String, args: List<String>) -> IO(Unit):
+  match args:
+    case "--check" <> rest: generate_args(program, rest, True{})
+    case _: generate_args(program, args, False{})
+
+def sqlite_args(args: List<String>) -> IO(Unit):
+  match args:
+    case [path, dir]: migrate(dir, R.open_sqlite(path))
+    case _: IO.die(Unit, 2, usage)
+
+def postgres_args(args: List<String>) -> IO(Unit):
+  match args:
+    case [dir]: migrate(dir, pg_open)
+    case _: IO.die(Unit, 2, usage)
+
+def migrate_args(args: List<String>) -> IO(Unit):
+  match args:
+    case "sqlite" <> rest: sqlite_args(rest)
+    case "postgres" <> rest: postgres_args(rest)
+    case _: IO.die(Unit, 2, usage)
+
+# Classify the command before matching its arguments. Deep, overlapping
+# string/list patterns otherwise expand the compiler's decision tree.
+def command_kind(+command: String) -> U32:
+  Bool.pick(U32, String.eq(command, "--help") || String.eq(command, "-h") || String.eq(command, "help"), 1,
+    Bool.pick(U32, String.eq(command, "check"), 2,
+      Bool.pick(U32, String.eq(command, "generate"), 3,
+        Bool.pick(U32, String.eq(command, "migrate"), 4, 0))))
+
+def command_args(program: String, kind: U32, args: List<String>) -> IO(Unit):
+  match kind:
+    case 1: help_args(args)
+    case 2: check_args(args)
+    case 3: generate_options(program, args)
+    case 4: migrate_args(args)
+    case _: IO.die(Unit, 2, usage)
 
 def dispatch(args: List<String>) -> IO(Unit):
   match args:
-    case _ <> "--help" <> Nil{}: IO.print(usage)
-    case _ <> "help" <> Nil{}: IO.print(usage)
-    case _ <> "check" <> schema <> dir <> Nil{}: check_cmd(schema, dir)
-    case path <> "generate" <> schema <> dir <> out <> Nil{}: generate_cmd(schema, dir, out, F.default_library(path))
-    case _ <> "generate" <> schema <> dir <> out <> lib <> Nil{}: generate_cmd(schema, dir, out, IO.pure(String, lib))
-    case _ <> "migrate" <> "sqlite" <> path <> dir <> Nil{}: migrate(dir, R.open_sqlite(path))
-    case _ <> "migrate" <> "postgres" <> dir <> Nil{}: migrate(dir, pg_open)
+    case program <> command <> rest: command_args(program, command_kind(command), rest)
     case _: IO.die(Unit, 2, usage)
 
 def main() -> IO(Unit):

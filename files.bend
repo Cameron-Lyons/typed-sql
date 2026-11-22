@@ -28,22 +28,63 @@ def strict_byte(state: Enc.Utf8, +byte: U32) -> M.Checked(Enc.Utf8):
       valid = U32.is_ge(byte, lo) && U32.is_le(byte, hi)
       Bool.pick(M.Checked(Enc.Utf8), valid, Done{Enc.utf8.cont.in(need, cp, byte, out, True{})}, Fail{"invalid UTF-8"})
 
-def strict_text(bytes: List<&2, U32>, expected: Nat, state: Enc.Utf8) -> M.Checked(String):
+def strict_bytes(bytes: List<&2, U32>, expected: Nat, state: Enc.Utf8) -> M.Checked(Enc.Utf8):
   match bytes expected state:
-    case Nil{} 0n Enc.Utf8{0, _, _, _, out}: Done{String.reverse(out)}
-    case Nil{} 0n _: Fail{"invalid UTF-8"}
+    case Nil{} 0n st: Done{st}
     case byte <> rest 1n+left st:
-      do M.Checked<String>:
+      do M.Checked<Enc.Utf8>:
         next : Enc.Utf8 <- strict_byte(st, byte)
-        strict_text(rest, left, next)
+        strict_bytes(rest, left, next)
     case _ _ _: Fail{"incomplete file read"}
 
-def read_done(+path: String, size: U32, pair: File & Result<&1, &1, U32 & String, List<&2, U32>>) -> IO(String):
-  (f, data) = pair
-  do IO<String>:
-    File.close(f)
-    bytes : List<&2, U32> <- result(List<&2, U32>, path, data)
-    checked(String, path, strict_text(bytes, U32.to_nat(size), Enc.Utf8{0, 128, 191, 0, ""}))
+def strict_finish(state: Enc.Utf8) -> M.Checked(String):
+  match state:
+    case Enc.Utf8{0, _, _, _, out}: Done{String.reverse(out)}
+    case _: Fail{"invalid UTF-8"}
+
+def strict_text(bytes: List<&2, U32>, expected: Nat, state: Enc.Utf8) -> M.Checked(String):
+  do M.Checked<String>:
+    decoded : Enc.Utf8 <- strict_bytes(bytes, expected, state)
+    strict_finish(decoded)
+
+type Reading is Data:
+  Reading{remaining: U32, decoder: Enc.Utf8}
+
+def read_chunk(data: Result<&1, &1, U32 & String, List<&2, U32>>, +size: U32,
+  remaining: U32, state: Enc.Utf8) -> M.Checked(Reading):
+  match data:
+    case Fail{(_, why)}: Fail{why}
+    case Done{bytes}:
+      do M.Checked<Reading>:
+        decoded : Enc.Utf8 <- strict_bytes(bytes, U32.to_nat(size), state)
+        return Reading{(remaining - size : U32), decoded}
+
+def read_chunk_pair(pair: File & Result<&1, &1, U32 & String, List<&2, U32>>,
+  size: U32, remaining: U32, state: Enc.Utf8) -> File & M.Checked(Reading):
+  (file, data) = pair
+  (file, read_chunk(data, size, remaining, state))
+
+# Keep only one 64 KiB byte chunk alongside the decoded text. The UTF-8
+# continuation state crosses chunk boundaries; short reads fail atomically.
+def read_chunks(fuel: Nat, +path: String, progress: File & M.Checked(Reading)) -> IO(String):
+  match fuel progress:
+    case _ Tuple{file, Fail{why}}:
+      do IO<String>:
+        File.close(file)
+        IO.die(String, 1, path ++ ": " ++ why)
+    case _ Tuple{file, Done{Reading{0, state}}}:
+      do IO<String>:
+        File.close(file)
+        checked(String, path, strict_finish(state))
+    case 0n Tuple{file, _}:
+      do IO<String>:
+        File.close(file)
+        IO.die(String, 1, path ++ ": incomplete file read")
+    case 1n+left Tuple{file, Done{Reading{+remaining, state}}}:
+      do IO<String>:
+        +size : U32 = U32.min(remaining, 65536)
+        pair : File & Result<&1, &1, U32 & String, List<&2, U32>> <- File.read_bytes(file, size)
+        read_chunks(left, path, read_chunk_pair(pair, size, remaining, state))
 
 def read_sized(path: String, f: File, size: Result<&1, &1, U32 & String, U32>) -> IO(String):
   match size:
@@ -52,9 +93,8 @@ def read_sized(path: String, f: File, size: Result<&1, &1, U32 & String, U32>) -
         File.close(f)
         result(String, path, Fail{e})
     case Done{+n}:
-      do IO<String>:
-        pair : File & Result<&1, &1, U32 & String, List<&2, U32>> <- File.read_bytes(f, n)
-        read_done(path, n, pair)
+      read_chunks(1n+U32.to_nat((n / 65536 : U32)), path,
+        (f, Done{Reading{n, Enc.Utf8{0, 128, 191, 0, ""}}}))
 
 def sized(path: String, pair: File & Result<&1, &1, U32 & String, U32>) -> IO(String):
   (f, size) = pair
@@ -177,16 +217,51 @@ def path_output(path: String, response: U32 & (String & String)) -> IO(String):
     case (0, (out, _)): IO.pure(String, String.reverse(String.drop(String.reverse(out), 1n)))
     case (_, (_, err)): IO.die(String, 1, path ++ ": could not resolve path " ++ String.trim_end(err))
 
-def resolve(+path: String, locate_command: Bool) -> IO(String):
-  # Bare executables are located by the shell just as they were at invocation.
-  # The path is always a separate argument, including names containing quotes.
-  script = Bool.pick(String, locate_command,
-    "p=$(command -v -- \"$1\") || exit 1; command -p realpath -- \"$p\"",
-    "command -p realpath -- \"$1\"")
+def canonical(+path: String) -> IO(String):
   do IO<String>:
-    r : Result<&1, &1, U32 & String, U32 & (String & String)> <- Process.run("/bin/sh", ["-c", script, "typed-sql", path], "", 65536, 10000)
+    r : Result<&1, &1, U32 & String, U32 & (String & String)> <- Process.run("/usr/bin/realpath", ["-e", "--", path], "", 65536, 10000)
     response : U32 & (String & String) <- result(U32 & (String & String), path, r)
     path_output(path, response)
+
+def executable_status(response: U32 & (String & String)) -> Bool:
+  (status, _) = response
+  U32.is_eq(status, 0)
+
+def executable_info(info: Result<&1, &1, U32 & String, Fs.Info>, +path: String) -> IO(Bool):
+  match info:
+    case Done{Fs.Info{Fs.Regular{}, _, _}}:
+      do IO<Bool>:
+        r : Result<&1, &1, U32 & String, U32 & (String & String)> <- Process.run("/usr/bin/test", ["-x", path], "", 65536, 10000)
+        response : U32 & (String & String) <- result(U32 & (String & String), path, r)
+        return executable_status(response)
+    case _: IO.pure(Bool, False{})
+
+# Search PATH in Bend, preserving empty entries (the current directory), and
+# pass literal arguments to the small OS utilities; no shell parses user paths.
+def find_command(paths: Strings, +program: String) -> IO(String):
+  match paths:
+    case Nil{}: IO.die(String, 1, program ++ ": executable not found in PATH")
+    case dir <> rest:
+      do IO<String>:
+        +path : String = Fs.path.join(dir, program)
+        info : Result<&1, &1, U32 & String, Fs.Info> <- Fs.stat(path)
+        found : Bool <- executable_info(info, path)
+        next : (Unit -> IO(String)) = Bool.pick(Unit -> IO(String), found,
+          _ => canonical(path), _ => find_command(rest, program))
+        next(Unit{})
+
+def search_path(env: Result<&1, &1, U32 & String, String>) -> Strings:
+  match env:
+    case Done{path}: String.split(path, ':')
+    case Fail{_}: ["/usr/bin", "/bin"]
+
+def resolve(path: String, locate_command: Bool) -> IO(String):
+  match locate_command:
+    case False{}: canonical(path)
+    case True{}:
+      do IO<String>:
+        env : Result<&1, &1, U32 & String, String> <- IO.get_env("PATH")
+        find_command(search_path(env), path)
 
 def default_library(+program: String) -> IO(String):
   do IO<String>:

@@ -5,44 +5,40 @@ import ./scripts.bend as S
 
 # Each step owns the session. Database errors retain it for ROLLBACK.
 def Action(-A: Data) -> Type:
-  R.Db -> IO(R.Outcome<A>)
+  R.Action(A)
 
 def Action.pure(-A: Data, x: A) -> Action(A):
-  db => IO.pure(R.Outcome<A>, R.Good{db, x})
-
-def next(-A: Data, -B: Data, r: R.Outcome<A>, f: A -> Action(B)) -> IO(R.Outcome<B>):
-  match r:
-    case R.Good{db, x}: f(x, db)
-    case R.Bad{db, e}: IO.pure(R.Outcome<B>, R.Bad{db, e})
-    case R.Disconnected{e}: IO.pure(R.Outcome<B>, R.Disconnected{e})
+  R.Action.pure(A, x)
 
 def Action.bind(-A: Data, -B: Data, a: Action(A), f: A -> Action(B)) -> Action(B):
-  db => IO.bind(R.Outcome<A>, R.Outcome<B>, a(db), r => next(A, B, r, f))
+  R.Action.bind(A, B, a, f)
 
 def checked(-A: Data, r: M.Checked(A)) -> Action(A):
-  match r:
-    case Done{x}: Action.pure(A, x)
-    case Fail{e}: db => IO.pure(R.Outcome<A>, R.Bad{db, e})
+  R.Action.checked(A, r)
 
 def execute(sqlite: String, pg: String, params: R.Row, width: U32) -> Action(R.Rows):
-  db => R.run(db, sqlite, pg, params, width)
+  R.query(sqlite, pg, params, width)
 
 def command(sql: String) -> Action(Unit):
-  db => R.discard(db, sql)
-
-def statements(xs: S.Strings) -> Action(Unit):
-  match xs:
-    case Nil{}: Action.pure(Unit, Unit{})
-    case sql <> rest:
-      do Action<Unit>:
-        command(sql)
-        statements(rest)
+  R.command(sql)
 
 def annotate(-A: Data, name: String, r: R.Outcome<A>) -> R.Outcome<A>:
   match r:
     case R.Good{db, x}: R.Good{db, x}
     case R.Bad{db, e}: R.Bad{db, name ++ ": " ++ e}
     case R.Disconnected{e}: R.Disconnected{name ++ ": " ++ e}
+
+def statements_at(xs: S.Strings, +index: U32) -> Action(Unit):
+  match xs:
+    case Nil{}: Action.pure(Unit, Unit{})
+    case sql <> rest:
+      do Action<Unit>:
+        db => IO.bind(R.Outcome<Unit>, R.Outcome<Unit>, command(sql, db), r =>
+          IO.pure(R.Outcome<Unit>, annotate(Unit, "statement " ++ U32.show(index), r)))
+        statements_at(rest, (index + 1 : U32))
+
+def statements(xs: S.Strings) -> Action(Unit):
+  statements_at(xs, 1)
 
 def apply_one(m: S.Migration) -> Action(Unit):
   S.Migration{version, +name, source, sql} = m
@@ -92,30 +88,12 @@ def apply_locked(xs: S.History) -> Action(U32):
     rows : R.Rows <- execute(sql, sql, Nil{}, 3)
     todo : S.History <- checked(S.History, pending(rows, xs))
     count : U32 <- apply_each(todo, 0)
-    command("COMMIT")
     return count
-
-def rolled_back(why: String, r: R.Outcome<R.Rows>) -> R.Outcome<U32>:
-  match r:
-    case R.Good{db, _}: R.Bad{db, why}
-    case R.Bad{db, e}: R.Bad{db, why ++ " (rollback: " ++ e ++ ")"}
-    case R.Disconnected{e}: R.Disconnected{why ++ " (rollback: " ++ e ++ ")"}
-
-def finish(r: R.Outcome<U32>) -> IO(R.Outcome<U32>):
-  match r:
-    case R.Good{db, n}: IO.pure(R.Outcome<U32>, R.Good{db, n})
-    case R.Disconnected{e}: IO.pure(R.Outcome<U32>, R.Disconnected{e})
-    case R.Bad{db, why}:
-      do IO<R.Outcome<U32>>:
-        rollback : R.Outcome<R.Rows> <- R.run(db, "ROLLBACK", "ROLLBACK", Nil{}, 0)
-        return rolled_back(why, rollback)
 
 # Begin outside the rollback handler: a failed BEGIN never gives us ownership
 # of a transaction. BEGIN IMMEDIATE also serializes competing SQLite writers.
 def transaction(xs: S.History) -> Action(U32):
-  do Action<U32>:
-    _ : R.Rows <- R.begin_migration
-    db => IO.bind(R.Outcome<U32>, R.Outcome<U32>, apply_locked(xs, db), finish)
+  db => R.transact(U32, R.begin_migration, apply_locked(xs), db)
 
 def apply(xs: S.History, db: R.Db) -> IO(R.Outcome<U32>):
   act = do Action<U32>:

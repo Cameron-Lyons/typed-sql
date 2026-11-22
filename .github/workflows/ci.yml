@@ -43,22 +43,30 @@ jobs:
           tar -xzf "$archive" -C "$HOME/.bend" --strip-components=1
           echo "$HOME/.bend/bin" >> "$GITHUB_PATH"
 
-      - name: Test checker and decoder
+      - name: Test checker, schema, files, and decoder
         run: |
-          bend tests/checker.bend
-          bend tests/decode.bend
+          for suite in lexer checker query_features schema_features files decode; do
+            bend "tests/$suite.bend" -o "$RUNNER_TEMP/$suite"
+            "$RUNNER_TEMP/$suite"
+          done
           bend tests/decode.bend -o "$RUNNER_TEMP/decode.js"
           node "$RUNNER_TEMP/decode.js"
+
+      - name: Build CLI and verify generated modules
+        run: |
+          bend main.bend -o "$RUNNER_TEMP/typed-sql"
+          "$RUNNER_TEMP/typed-sql" generate --check examples/migrations/001_books.sql examples/queries examples/queries.bend .
+          "$RUNNER_TEMP/typed-sql" generate --check tests/fixtures/schema.sql tests/fixtures/queries tests/fixtures/generated.bend .
 
       - name: Test runtime and migrations on both databases
         env:
           TEST_PG_PORT: ${{ job.services.postgres.ports[5432] }}
         run: |
-          for suite in runtime migrations; do
+          for suite in runtime migrations integration; do
             bend "tests/$suite.bend" -o "$RUNNER_TEMP/$suite"
             "$RUNNER_TEMP/$suite"
             "$RUNNER_TEMP/$suite" "$TEST_PG_PORT" postgres postgres
           done
 
       - name: Test CLI and generated SQLite caller
-        run: sh tests/cli.sh
+        run: sh tests/cli.sh "$RUNNER_TEMP/typed-sql"
