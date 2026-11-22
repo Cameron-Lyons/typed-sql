@@ -41,24 +41,43 @@ def names(p: Projection) -> M.Fields:
     case Nil{}: Nil{}
     case Projected{_, f} <> t: f <> names(t)
 
-def output_name(p: Projected) -> String:
-  Projected{_, M.Field{name, _, _}} = p
-  name
-
-def project_groups(xs: L.Groups, +fs: M.Fields) -> M.Checked(Projection):
+def project_groups(xs: L.Groups, +fs: M.Fields, star_seen: Bool) -> M.Checked(Projection):
   match xs:
     case Nil{}: Done{Nil{}}
+    case ["*"] <> t:
+      do M.Checked<Projection>:
+        S.require(Bool.not(star_seen), "duplicate * in projection")
+        rest : Projection <- project_groups(t, fs, True{})
+        return List.append(&2, Projected, project_all(fs), rest)
     case ts <> t:
       do M.Checked<Projection>:
-        +col : Projected <- project_one(ts, fs)
-        +tail : Projection <- project_groups(t, fs)
-        S.require(Bool.not(S.has_field(names(tail), output_name(col))), "duplicate output column: " ++ output_name(col))
+        col : Projected <- project_one(ts, fs)
+        tail : Projection <- project_groups(t, fs, star_seen)
         return col <> tail
 
-def project(ts: L.Tokens, fs: M.Fields) -> M.Checked(Projection):
+def Aliases() -> Data:
+  Map<&2, String>
+
+def index_outputs(p: Projection, +aliases: Aliases) -> M.Checked(Aliases):
+  match p:
+    case Nil{}: Done{aliases}
+    case Projected{source, M.Field{+name, _, _}} <> t:
+      duplicate = Pair.snd(Aliases, Bool, Map.has(&2, String, aliases, name))
+      do M.Checked<Aliases>:
+        S.require(Bool.not(duplicate), "duplicate output column: " ++ name)
+        index_outputs(t, Map.set(&2, String, aliases, name, source))
+
+type Columns is Data:
+  Columns{projection: Projection, aliases: Aliases}
+
+def project(ts: L.Tokens, fs: M.Fields) -> M.Checked(Columns):
   match ts:
-    case "*" <> Nil{}: Done{project_all(fs)}
-    case _: project_groups(L.chunks(ts, ","), fs)
+    case "*" <> Nil{}: Done{Columns{project_all(fs), MTip{}}}
+    case _:
+      do M.Checked<Columns>:
+        +p : Projection <- project_groups(L.chunks(ts, ","), fs, False{})
+        aliases : Aliases <- index_outputs(p, MTip{})
+        return Columns{p, aliases}
 
 def sql_name(name: String) -> String:
   "\"" ++ name ++ "\""
@@ -97,23 +116,118 @@ def checked(name: String, plan: Plan) -> M.Query:
   M.Query{name, statement(head, projection, tail, params, True{}),
     statement(head, projection, tail, params, False{}), params, names(projection)}
 
+def order_nulls(ts: L.Tokens, +direction: String) -> M.Checked(String):
+  match ts:
+    case Nil{}:
+      place = Bool.pick(String, String.eq(direction, "asc"), "last", "first")
+      Done{direction ++ " nulls " ++ place}
+    case ["nulls", +place]:
+      do M.Checked<String>:
+        S.require(String.eq(place, "first") || String.eq(place, "last"), "expected NULLS FIRST or NULLS LAST")
+        return direction ++ " nulls " ++ place
+    case _: Fail{"expected [ASC | DESC] [NULLS FIRST | LAST] in ORDER BY"}
+
+def order_direction(ts: L.Tokens) -> M.Checked(String):
+  match ts:
+    case "asc" <> t: order_nulls(t, "asc")
+    case "desc" <> t: order_nulls(t, "desc")
+    case _: order_nulls(ts, "asc")
+
+def order_source(alias: String, +name: String, fs: M.Fields) -> M.Checked(String):
+  match alias:
+    case SNil{}:
+      do M.Checked<String>:
+        f : M.Field <- S.lookup(fs, name)
+        return name
+    case _: Done{alias}
+
+# ORDER BY names prefer output aliases. Qualify the original column so SQLite
+# orders its stored value even when a projected integer is returned as text.
+def order_terms(xs: L.Groups, +table: String, +fs: M.Fields, +aliases: Aliases) -> M.Checked(L.Tokens):
+  match xs:
+    case Nil{}: Done{Nil{}}
+    case (+name <> modifiers) <> t:
+      alias = Pair.snd(Aliases, String, Map.get(String, "", aliases, name))
+      do M.Checked<L.Tokens>:
+        source : String <- order_source(alias, name, fs)
+        direction : String <- order_direction(modifiers)
+        rest : L.Tokens <- order_terms(t, table, fs, aliases)
+        return (sql_name(table) ++ "." ++ sql_name(source) ++ " " ++ direction) <> rest
+    case _: Fail{"empty ORDER BY term"}
+
+def ordering(ts: L.Tokens, found: Bool, table: String, fs: M.Fields, aliases: Aliases) -> M.Checked(L.Tokens):
+  match ts found:
+    case _ False{}: Done{Nil{}}
+    case "by" <> terms True{}:
+      do M.Checked<L.Tokens>:
+        items : L.Tokens <- order_terms(L.chunks(terms, ","), table, fs, aliases)
+        return ["order", "by", String.join(items, ", ")]
+    case _ _: Fail{"expected ORDER BY"}
+
+def page_value(ts: L.Tokens) -> M.Checked(String):
+  match ts:
+    case "+" <> +n <> Nil{}:
+      do M.Checked<String>:
+        S.require(B.integer_literal(n, False{}), "expected nonnegative integer in LIMIT or OFFSET")
+        return n
+    case +n <> Nil{}:
+      do M.Checked<String>:
+        S.require(B.integer_literal(n, False{}), "expected nonnegative integer in LIMIT or OFFSET")
+        return n
+    case _: Fail{"expected nonnegative integer in LIMIT or OFFSET"}
+
+def page_bounds(split: L.Split) -> M.Checked(L.Tokens):
+  match split:
+    case L.Split{count, _, False{}}:
+      do M.Checked<L.Tokens>:
+        n : String <- page_value(count)
+        return ["limit", n]
+    case L.Split{count, offset, True{}}:
+      do M.Checked<L.Tokens>:
+        n : String <- page_value(count)
+        m : String <- page_value(offset)
+        return ["limit", n, "offset", m]
+
+def pagination(ts: L.Tokens, found: Bool) -> M.Checked(L.Tokens):
+  match found:
+    case False{}: Done{Nil{}}
+    case True{}: page_bounds(L.split_at(ts, "offset", Nil{}))
+
+def select_order(split: L.Split, page: L.Tokens, columns: Columns, +table: String, +fs: M.Fields) -> M.Checked(Plan):
+  L.Split{+conditions, sort, has_sort} = split
+  Columns{cols, aliases} = columns
+  do M.Checked<Plan>:
+    params : M.Fields <- B.where_tail(conditions, fs, Nil{})
+    ordered : L.Tokens <- ordering(sort, has_sort, table, fs, aliases)
+    tail : L.Tokens = List.append(&2, String, conditions, List.append(&2, String, ordered, page))
+    return Plan{["select"], cols, "from" <> table <> tail, params}
+
+def select_limit(split: L.Split, columns: Columns, table: String, fs: M.Fields) -> M.Checked(Plan):
+  L.Split{filtered, values, found} = split
+  do M.Checked<Plan>:
+    page : L.Tokens <- pagination(values, found)
+    select_order(L.split_at(filtered, "order", Nil{}), page, columns, table, fs)
+
 def select_parts(split: L.Split, tables: M.Schema) -> M.Checked(Plan):
   match split:
-    case L.Split{projections, +table <> +rest, True{}}:
+    case L.Split{projections, +table <> rest, True{}}:
       do M.Checked<Plan>:
         +fs : M.Fields <- S.find_table(tables, table)
-        cols : Projection <- project(projections, fs)
-        params : M.Fields <- B.where_tail(rest, fs, Nil{})
-        return Plan{["select"], cols, "from" <> table <> rest, params}
+        cols : Columns <- project(projections, fs)
+        select_limit(L.split_at(rest, "limit", Nil{}), cols, table, fs)
     case _: Fail{"expected SELECT columns FROM table"}
+
+def returning_plan(core: L.Tokens, columns: Columns, params: M.Fields) -> Plan:
+  Columns{cols, _} = columns
+  Plan{List.append(&2, String, core, ["returning"]), cols, Nil{}, params}
 
 def wrote(+core: L.Tokens, returning: L.Tokens, found: Bool, fs: M.Fields, params: M.Fields) -> M.Checked(Plan):
   match found:
     case False{}: Done{Plan{core, Nil{}, Nil{}, params}}
     case True{}:
       do M.Checked<Plan>:
-        cols : Projection <- project(returning, fs)
-        return Plan{List.append(&2, String, core, ["returning"]), cols, Nil{}, params}
+        cols : Columns <- project(returning, fs)
+        return returning_plan(core, cols, params)
 
 def assigned(tokens: L.Tokens, +fs: M.Fields, +seen: M.Fields, params: M.Fields) -> M.Checked(M.Fields):
   match tokens:
@@ -206,10 +320,14 @@ def single(groups: L.Groups) -> M.Checked(L.Tokens):
     case ts <> Nil{} <> Nil{}: Done{ts}
     case _: Fail{"expected exactly one SQL query"}
 
-def query(tables: M.Schema, +name: String, sql: String) -> M.Checked(M.Query):
-  do M.Checked<M.Query>:
+def analyze(tables: M.Schema, +name: String, sql: String) -> M.Checked(Plan):
+  do M.Checked<Plan>:
     S.require(L.identifier(name), "invalid query name: " ++ name)
     tokens : L.Tokens <- L.tokenize(sql)
     ts : L.Tokens <- single(L.chunks(tokens, ";"))
-    compiled : Plan <- plan(ts, tables)
+    plan(ts, tables)
+
+def query(tables: M.Schema, +name: String, sql: String) -> M.Checked(M.Query):
+  do M.Checked<M.Query>:
+    compiled : Plan <- analyze(tables, name, sql)
     return checked(name, compiled)

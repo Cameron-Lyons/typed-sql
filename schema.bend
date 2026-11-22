@@ -42,7 +42,9 @@ def lookup(fs: M.Fields, +name: String) -> M.Checked(M.Field):
   match fs:
     case Nil{}: Fail{"unknown column: " ++ name}
     case M.Field{+n, +kind, +nullable} <> t:
-      Bool.pick(M.Checked(M.Field), String.eq(n, name), Done{M.Field{n, kind, nullable}}, lookup(t, name))
+      next = Bool.pick(Unit -> M.Checked(M.Field), String.eq(n, name),
+        _ => Done{M.Field{n, kind, nullable}}, _ => lookup(t, name))
+      next(Unit{})
 
 def has_table(tables: M.Schema, +name: String) -> Bool:
   match tables:
@@ -53,7 +55,9 @@ def find_table(tables: M.Schema, +name: String) -> M.Checked(M.Fields):
   match tables:
     case Nil{}: Fail{"unknown table: " ++ name}
     case M.Table{n, fs} <> t:
-      Bool.pick(M.Checked(M.Fields), String.eq(n, name), Done{fs}, find_table(t, name))
+      next = Bool.pick(Unit -> M.Checked(M.Fields), String.eq(n, name),
+        _ => Done{fs}, _ => find_table(t, name))
+      next(Unit{})
 
 def kind(s: String) -> M.Checked(M.SqlType):
   match s:

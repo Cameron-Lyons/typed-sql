@@ -30,10 +30,16 @@ def digits(s: String) -> Bool:
     case SNil{}: True{}
     case SCon{c, t}: Char.is_digit(c) && digits(t)
 
+def significant(s: String) -> String:
+  match s:
+    case SCon{Chr{48}, t}: significant(t)
+    case _: s
+
 def integer_literal(+s: String, negative: Bool) -> Bool:
-  +n = String.length(s)
+  +magnitude = significant(s)
+  +n = String.length(magnitude)
   limit = Bool.pick(String, negative, "9223372036854775808", "9223372036854775807")
-  Bool.not(String.is_empty(s)) && digits(s) && (Nat.is_lt(n, 19n) || (Nat.is_eq(n, 19n) && String.is_le(s, limit)))
+  Bool.not(String.is_empty(s)) && digits(magnitude) && (Nat.is_lt(n, 19n) || (Nat.is_eq(n, 19n) && String.is_le(magnitude, limit)))
 
 def literal(kind: M.SqlType, +value: String, negative: Bool) -> Bool:
   match kind:
@@ -54,6 +60,10 @@ def value(tokens: L.Tokens, field: M.Field, params: M.Fields) -> M.Checked(M.Fie
     case raw <> Nil{} M.Field{n, k, _}:
       do M.Checked<M.Fields>:
         S.require(literal(k, raw, False{}), "expected a typed literal or :parameter for " ++ n)
+        return params
+    case "+" <> raw <> Nil{} M.Field{n, M.SqlInt{}, _}:
+      do M.Checked<M.Fields>:
+        S.require(integer_literal(raw, False{}), "invalid positive integer for " ++ n)
         return params
     case "-" <> raw <> Nil{} M.Field{n, k, _}:
       do M.Checked<M.Fields>:

@@ -13,23 +13,21 @@ def letter(+c: Char) -> Bool:
 def word_char(+c: Char) -> Bool:
   letter(c) || Char.is_digit(c)
 
-def word_tail(s: String) -> Bool:
-  match s:
-    case SNil{}: True{}
-    case SCon{c, t}: word_char(c) && word_tail(t)
+def identifier_tail(s: String, remaining: Nat) -> Bool:
+  match s remaining:
+    case SNil{} _: True{}
+    case SCon{_, _} 0n: False{}
+    case SCon{c, t} 1n+n: word_char(c) && identifier_tail(t, n)
 
-def word(s: String) -> Bool:
+def identifier(s: String) -> Bool:
   match s:
     case SNil{}: False{}
-    case SCon{c, t}: letter(c) && word_tail(t)
-
-def identifier(+s: String) -> Bool:
-  word(s) && Nat.is_le(String.length(s), 63n)
+    case SCon{c, t}: letter(c) && identifier_tail(t, 62n)
 
 def flush(buf: String, acc: Tokens) -> Tokens:
   match buf:
     case SNil{}: acc
-    case SCon{c, t}: String.to_lower(String.reverse(SCon{c, t})) <> acc
+    case SCon{c, t}: String.reverse(SCon{c, t}) <> acc
 
 type Mode is Data:
   Normal{word: String}
@@ -37,22 +35,11 @@ type Mode is Data:
   LineComment{}
   BlockComment{}
 
-type Step is Data:
-  Step{mode: Mode, out: Tokens}
-
-def Step.mode(s: Step) -> Mode:
-  Step{m, _} = s
-  m
-
-def Step.out(s: Step) -> Tokens:
-  Step{_, xs} = s
-  xs
-
-def ordinary(+c: Char, +buf: String, +acc: Tokens, space: Bool, part: Bool) -> Step:
+def ordinary_tokens(c: Char, buf: String, acc: Tokens, space: Bool, part: Bool) -> Tokens:
   match space part:
-    case True{} _: Step{Normal{""}, flush(buf, acc)}
-    case _ True{}: Step{Normal{SCon{c, buf}}, acc}
-    case _ _: Step{Normal{""}, SCon{c, ""} <> flush(buf, acc)}
+    case True{} _: flush(buf, acc)
+    case _ True{}: acc
+    case _ _: SCon{c, ""} <> flush(buf, acc)
 
 def scan(s: String, mode: Mode, acc: Tokens) -> M.Checked(Tokens):
   match s mode:
@@ -80,12 +67,15 @@ def scan(s: String, mode: Mode, acc: Tokens) -> M.Checked(Tokens):
     case SCon{Chr{62}, SCon{Chr{61}, t}} Normal{buf}: scan(t, Normal{""}, ">=" <> flush(buf, acc))
     case SCon{Chr{60}, SCon{Chr{62}, t}} Normal{buf}: scan(t, Normal{""}, "<>" <> flush(buf, acc))
     case SCon{Chr{33}, SCon{Chr{61}, t}} Normal{buf}: scan(t, Normal{""}, "!=" <> flush(buf, acc))
-    case SCon{+c, t} Normal{buf}:
-      +step = ordinary(c, buf, acc, Char.is_space(c), word_char(c))
-      scan(t, Step.mode(step), Step.out(step))
+    case SCon{+c, t} Normal{+buf}:
+      +part = word_char(c)
+      next = Bool.pick(String, part, SCon{Char.to_lower(c), buf}, "")
+      scan(t, Normal{next}, ordinary_tokens(c, buf, acc, Char.is_space(c), part))
 
 def tokenize(sql: String) -> M.Checked(Tokens):
-  scan(sql, Normal{""}, Nil{})
+  match sql:
+    case SCon{Chr{65279}, t}: scan(t, Normal{""}, Nil{})
+    case _: scan(sql, Normal{""}, Nil{})
 
 type Split is Data:
   Split{before: Tokens, after: Tokens, found: Bool}
@@ -94,14 +84,19 @@ def split_at(ts: Tokens, +sep: String, +acc: Tokens) -> Split:
   match ts:
     case Nil{}: Split{List.reverse(&2, String, acc), Nil{}, False{}}
     case +h <> +t:
-      Bool.pick(Split, String.eq(h, sep), Split{List.reverse(&2, String, acc), t, True{}}, split_at(t, sep, h <> acc))
+      next = Bool.pick(Unit -> Split, String.eq(h, sep),
+        _ => Split{List.reverse(&2, String, acc), t, True{}},
+        _ => split_at(t, sep, h <> acc))
+      next(Unit{})
 
-def groups(ts: Tokens, +sep: String, +acc: Tokens, +chunks: Groups) -> Groups:
+def groups(ts: Tokens, +sep: String, +acc: Tokens, +parts: Groups) -> Groups:
   match ts:
-    case Nil{}: List.reverse(&2, Tokens, List.reverse(&2, String, acc) <> chunks)
+    case Nil{}: List.reverse(&2, Tokens, List.reverse(&2, String, acc) <> parts)
     case +h <> +t:
-      +split = String.eq(h, sep)
-      groups(t, sep, Bool.pick(Tokens, split, Nil{}, h <> acc), Bool.pick(Groups, split, List.reverse(&2, String, acc) <> chunks, chunks))
+      next = Bool.pick(Unit -> Groups, String.eq(h, sep),
+        _ => groups(t, sep, Nil{}, List.reverse(&2, String, acc) <> parts),
+        _ => groups(t, sep, h <> acc, parts))
+      next(Unit{})
 
 def chunks(ts: Tokens, sep: String) -> Groups:
   groups(ts, sep, Nil{}, Nil{})

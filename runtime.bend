@@ -102,21 +102,29 @@ def read_row(remaining: Nat, +stmt: U32, +index: U32) -> SqlIO(Row):
         rest : Row <- read_row(tail, stmt, (index + 1 : U32))
         return cell <> rest
 
-def read_rows(fuel: Nat, row_ready: Bool, +stmt: U32, +width: Nat, rows: Rows) -> SqlIO(Rows):
-  match fuel row_ready:
-    case _ False{}: SqlIO.pure(Rows, List.reverse(&2, Row, rows))
-    case 0n True{}: IO.pure(Result<&1, &1, U32 & String, Rows>, Fail{(18, "too many result rows")})
-    case 1n+remaining True{}:
+type Output is Data:
+  Read{width: Nat}
+  Discard{}
+
+def read_rows(fuel: Nat, row_ready: Bool, +stmt: U32, output: Output, rows: Rows) -> SqlIO(Rows):
+  match fuel row_ready output:
+    case _ False{} _: SqlIO.pure(Rows, List.reverse(&2, Row, rows))
+    case 0n True{} _: IO.pure(Result<&1, &1, U32 & String, Rows>, Fail{(18, "too many result rows")})
+    case 1n+remaining True{} Discard{}:
+      do SqlIO<Rows>:
+        ready : Bool <- S.stmt.step(stmt)
+        read_rows(remaining, ready, stmt, Discard{}, rows)
+    case 1n+remaining True{} Read{+width}:
       do SqlIO<Rows>:
         row : Row <- read_row(width, stmt, 0)
         ready : Bool <- S.stmt.step(stmt)
-        read_rows(remaining, ready, stmt, width, row <> rows)
+        read_rows(remaining, ready, stmt, Read{width}, row <> rows)
 
-def execute_stmt(+stmt: U32, params: Row, width: U32) -> SqlIO(Rows):
+def execute_stmt(+stmt: U32, params: Row, output: Output) -> SqlIO(Rows):
   do SqlIO<Rows>:
     bind_params(params, stmt, 1)
     ready : Bool <- S.stmt.step(stmt)
-    read_rows(Nat.mul(65536n, 65536n), ready, stmt, U32.to_nat(width), Nil{})
+    read_rows(Nat.mul(65536n, 65536n), ready, stmt, output, Nil{})
 
 def sqlite_finished(r: Result<&1, &1, U32 & String, Rows>, finalized: Result<&1, &1, U32 & String, Unit>, db: U32) -> Outcome<Rows>:
   match r finalized:
@@ -124,12 +132,12 @@ def sqlite_finished(r: Result<&1, &1, U32 & String, Rows>, finalized: Result<&1,
     case Done{rows} Fail{e}: Bad{SQLite{db}, sqlite_message(e)}
     case Done{rows} Done{_}: Good{SQLite{db}, rows}
 
-def sqlite_prepared(r: Result<&1, &1, U32 & String, U32>, db: U32, params: Row, width: U32) -> IO(Outcome<Rows>):
+def sqlite_prepared(r: Result<&1, &1, U32 & String, U32>, db: U32, params: Row, output: Output) -> IO(Outcome<Rows>):
   match r:
     case Fail{e}: IO.pure(Outcome<Rows>, Bad{SQLite{db}, sqlite_message(e)})
     case Done{+stmt}:
       do IO<Outcome<Rows>>:
-        result : Result<&1, &1, U32 & String, Rows> <- execute_stmt(stmt, params, width)
+        result : Result<&1, &1, U32 & String, Rows> <- execute_stmt(stmt, params, output)
         finalized : Result<&1, &1, U32 & String, Unit> <- S.stmt.finalize(stmt)
         return sqlite_finished(result, finalized, db)
 
@@ -163,28 +171,45 @@ def pg_return_rows(valid: Bool, conn: Pg.Conn, rows: List<&1, List<&1, Maybe<&1,
     case True{}: Good{Postgres{conn}, pg_rows(rows, Nil{})}
     case False{}: Bad{Postgres{conn}, "unexpected Postgres result column count"}
 
-def pg_finished(r: Result<&1, &1, Pg.Failure, Pg.Conn & Pg.Reply>, +width: U32) -> Outcome<Rows>:
-  match r:
-    case Fail{e}: Disconnected{pg_failure(e)}
-    case Done{(conn, Pg.Failed{e})}: Bad{Postgres{conn}, pg_message(e)}
-    case Done{(conn, Pg.Rows{fields, rows, _})}:
-      valid = U32.is_eq(width, 0) || Nat.is_eq(U32.to_nat(width), List.length(&1, Codec.Field, fields))
+def pg_finished(r: Result<&1, &1, Pg.Failure, Pg.Conn & Pg.Reply>, output: Output) -> Outcome<Rows>:
+  match r output:
+    case Fail{e} _: Disconnected{pg_failure(e)}
+    case Done{(conn, Pg.Failed{e})} _: Bad{Postgres{conn}, pg_message(e)}
+    case Done{(conn, Pg.Rows{_, _, _})} Discard{}: Good{Postgres{conn}, Nil{}}
+    case Done{(conn, Pg.Rows{fields, rows, _})} Read{+width}:
+      valid = Nat.is_eq(width, 0n) || Nat.is_eq(width, List.length(&1, Codec.Field, fields))
       pg_return_rows(valid, conn, rows)
 
-def run(db: Db, sqlite_sql: String, pg_sql: String, params: Row, width: U32) -> IO(Outcome<Rows>):
+def execute(db: Db, sqlite_sql: String, pg_sql: String, params: Row, output: Output) -> IO(Outcome<Rows>):
   match db:
     case SQLite{+id}:
       do IO<Outcome<Rows>>:
         prepared : Result<&1, &1, U32 & String, U32> <- S.stmt.prepare(id, sqlite_sql)
-        sqlite_prepared(prepared, id, params, width)
+        sqlite_prepared(prepared, id, params, output)
     case Postgres{conn}:
       do IO<Outcome<Rows>>:
         result : Result<&1, &1, Pg.Failure, Pg.Conn & Pg.Reply> <- Pg.query(conn, pg_bytes(pg_sql), pg_params(params))
-        return pg_finished(result, width)
+        return pg_finished(result, output)
+
+def run(db: Db, sqlite_sql: String, pg_sql: String, params: Row, width: U32) -> IO(Outcome<Rows>):
+  execute(db, sqlite_sql, pg_sql, params, Read{U32.to_nat(width)})
+
+def discarded(r: Outcome<Rows>) -> Outcome<Unit>:
+  match r:
+    case Good{db, _}: Good{db, Unit{}}
+    case Bad{db, why}: Bad{db, why}
+    case Disconnected{why}: Disconnected{why}
+
+# Migration statements may have RETURNING. Drain them without decoding cells.
+def discard(db: Db, +sql: String) -> IO(Outcome<Unit>):
+  do IO<Outcome<Unit>>:
+    r : Outcome<Rows> <- execute(db, sql, sql, Nil{}, Discard{})
+    return discarded(r)
 
 def pg_begin(idle: Bool, conn: Pg.Conn) -> IO(Outcome<Rows>):
   match idle:
-    case True{}: run(Postgres{conn}, "", "BEGIN", Nil{}, 0)
+    # A migrator waiting for the lock needs a fresh snapshot to read history.
+    case True{}: run(Postgres{conn}, "", "BEGIN ISOLATION LEVEL READ COMMITTED", Nil{}, 0)
     case False{}: IO.pure(Outcome<Rows>, Bad{Postgres{conn}, "migration requires an idle connection"})
 
 # PostgreSQL accepts a nested BEGIN with a warning. Check ReadyForQuery's
