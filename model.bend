@@ -12,13 +12,13 @@ def Fields() -> Data:
   List<&2, Field>
 
 type Table is Data:
-  Table{name: String, fields: Fields}
+  Table{name: String, fields: Fields, defaults: List<&2, String>, keys: List<&2, List<&2, String>>}
 
 def Schema() -> Data:
   List<&2, Table>
 
 type Query is Data:
-  Query{name: String, sqlite_sql: String, postgres_sql: String, params: Fields, columns: Fields}
+  Query{name: String, sqlite_sql: String, postgres_sql: String, params: Fields, columns: Fields, bounds: List<&2, String>}
 
 def Checked(-A: Data) -> Data:
   Result<&2, &2, String, A>

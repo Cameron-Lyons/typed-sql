@@ -8,6 +8,11 @@ def I64() -> Data:
 def write_int(value: I64) -> String:
   Int.I64.show(value)
 
+# Reuse the text codec: Bend 2.0.40's native backend exceeds its arity limit
+# when specializing the dependency's bit-level I64.is_neg implementation.
+def nonnegative(value: I64) -> Bool:
+  Bool.not(String.starts_with(Int.I64.show(value), "-"))
+
 def write_text(value: String) -> String:
   value
 

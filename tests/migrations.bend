@@ -35,6 +35,12 @@ def check_rows(r: R.Outcome<R.Rows>) -> IO(R.Db):
     case R.Bad{db, e}: IO.die(R.Db, 1, e)
     case _: IO.die(R.Db, 1, "the failed batch changed the database")
 
+def check_view(r: R.Outcome<R.Rows>) -> IO(R.Db):
+  match r:
+    case R.Good{db, [[Some{"3"}, Some{"staged"}]]}: IO.pure(R.Db, db)
+    case R.Bad{db, e}: IO.die(R.Db, 1, e)
+    case _: IO.die(R.Db, 1, "view or temporary staging migration failed")
+
 def rejected(-A: Data, r: M.Checked(A)) -> Bool:
   match r:
     case Fail{_}: True{}
@@ -44,6 +50,23 @@ def kept_sql(r: M.Checked(S.Migration), expected: String) -> Bool:
   match r:
     case Done{S.Migration{_, _, _, [stmt]}}: String.eq(stmt, expected)
     case _: False{}
+
+def history_tests() -> IO(Unit):
+  do IO<Unit>:
+    +sql : String = "CREATE TABLE sample(id BIGINT)"
+    +one : S.Migration <- F.checked(S.Migration, "first", S.parse("1_first.sql", sql))
+    +three : S.Migration <- F.checked(S.Migration, "third", S.parse("3_third.sql", "DROP TABLE sample"))
+    two : S.Migration <- F.checked(S.Migration, "inserted", S.parse("2_inserted.sql", "CREATE INDEX idx ON sample(id)"))
+    renamed : S.Migration <- F.checked(S.Migration, "renamed", S.parse("1_renamed.sql", sql))
+    changed : S.Migration <- F.checked(S.Migration, "changed", S.parse("1_first.sql", sql ++ " -- changed"))
+    +first : R.Row = [Some{"1"}, Some{"1_first.sql"}, Some{sql}]
+    third : R.Row = [Some{"3"}, Some{"3_third.sql"}, Some{"DROP TABLE sample"}]
+    assert(Bool.not(rejected(S.History, Mig.pending([first], [one, three]))), "pending suffix must be accepted")
+    assert(rejected(S.History, Mig.pending([first], [renamed])), "renamed migration must be rejected")
+    assert(rejected(S.History, Mig.pending([first], [changed])), "comment-only migration change must be rejected")
+    assert(rejected(S.History, Mig.pending([first, third], [one, two, three])), "migration inserted before applied version must be rejected")
+    assert(rejected(S.History, Mig.pending([[None{}, Some{"1_first.sql"}, Some{sql}]], [one])), "NULL history fields must be rejected")
+    assert(rejected(S.History, Mig.pending([[Some{"1"}, Some{"1_first.sql"}]], [one])), "short history rows must be rejected")
 
 def exercise(db: R.Db) -> IO(Unit):
   do IO<Unit>:
@@ -63,7 +86,7 @@ def exercise(db: R.Db) -> IO(Unit):
     dupe : R.Outcome<U32> <- Mig.apply([one, two, two], d)
     e : R.Db <- fails(dupe, "duplicate migration version")
     partial : R.Outcome<U32> <- Mig.apply([one, two, three, four], e)
-    f : R.Db <- fails(partial, "4_fail.sql")
+    f : R.Db <- fails(partial, "4_fail.sql: statement 2")
     +sql : String = "SELECT CAST(id AS TEXT), label FROM items ORDER BY id"
     rows : R.Outcome<R.Rows> <- R.run(f, sql, sql, Nil{}, 2)
     g : R.Db <- check_rows(rows)
@@ -72,10 +95,24 @@ def exercise(db: R.Db) -> IO(Unit):
     bad : S.Migration <- F.checked(S.Migration, "deferred", S.parse("4_deferred.sql", "CREATE TABLE links(id BIGINT REFERENCES items(id) DEFERRABLE INITIALLY DEFERRED); INSERT INTO links VALUES (42);"))
     deferred : R.Outcome<U32> <- Mig.apply([one, two, three, bad], h)
     i : R.Db <- fails(deferred, "foreign key")
-    fixed : S.Migration <- F.checked(S.Migration, "fixed", S.parse("4_deferred.sql", "CREATE TABLE links(id BIGINT REFERENCES items(id) DEFERRABLE INITIALLY DEFERRED); INSERT INTO links VALUES (1);"))
+    +fixed : S.Migration <- F.checked(S.Migration, "fixed", S.parse("4_deferred.sql", "CREATE TABLE links(id BIGINT REFERENCES items(id) DEFERRABLE INITIALLY DEFERRED); INSERT INTO links VALUES (1);"))
     corrected : R.Outcome<U32> <- Mig.apply([one, two, three, fixed], i)
     j : R.Db <- counts(corrected, 1)
-    R.close(j)
+    +views : S.Migration <- F.checked(S.Migration, "views", S.parse("5_views.sql", "CREATE TEMPORARY TABLE stage_items(id BIGINT, label TEXT); INSERT INTO stage_items VALUES (3, 'staged'); CREATE TEMP VIEW stage_view AS SELECT id, label FROM stage_items; INSERT INTO items SELECT id, label FROM stage_view; DROP VIEW stage_view; DROP TABLE stage_items; CREATE VIEW \"item;view\" AS SELECT id, label FROM items;"))
+    staged : R.Outcome<U32> <- Mig.apply([one, two, three, fixed, views], j)
+    k : R.Db <- counts(staged, 1)
+    +view_sql : String = "SELECT CAST(id AS TEXT), label FROM \"item;view\" WHERE id = 3"
+    from_view : R.Outcome<R.Rows> <- R.run(k, view_sql, view_sql, Nil{}, 2)
+    l : R.Db <- check_view(from_view)
+    failed_drop : S.Migration <- F.checked(S.Migration, "failed drop", S.parse("6_drop.sql", "DROP VIEW \"item;view\"; INSERT INTO items VALUES (1, 'duplicate');"))
+    dropped : R.Outcome<U32> <- Mig.apply([one, two, three, fixed, views, failed_drop], l)
+    m : R.Db <- fails(dropped, "6_drop.sql: statement 2")
+    restored : R.Outcome<R.Rows> <- R.run(m, view_sql, view_sql, Nil{}, 2)
+    n : R.Db <- check_view(restored)
+    drop : S.Migration <- F.checked(S.Migration, "drop", S.parse("6_drop.sql", "DROP VIEW \"item;view\";"))
+    finished : R.Outcome<U32> <- Mig.apply([one, two, three, fixed, views, drop], n)
+    o : R.Db <- counts(finished, 1)
+    R.close(o)
     IO.print("migration tests passed")
 
 def connected(r: Result<&1, &1, String, R.Db>) -> IO(Unit):
@@ -116,16 +153,36 @@ def main() -> IO(Unit):
     assert(kept_sql(S.parse("1_comments.sql", "/* header */" ++ continued ++ "; -- trailing"), continued), "inline SQL comments and newlines changed")
     +rename : String = "ALTER INDEX old_name RENAME TO new_name"
     assert(kept_sql(S.parse("1_rename.sql", rename), rename), "index DDL must be accepted")
+    +view_rename : String = "ALTER VIEW old_name RENAME TO new_name"
+    assert(kept_sql(S.parse("1_view.sql", view_rename), view_rename), "view DDL must be accepted")
+    +temp : String = "CREATE TEMP/* modifiers */TABLE scratch(id BIGINT)"
+    assert(kept_sql(S.parse("1_temp.sql", temp), temp), "temporary table with comments must be accepted")
+    +quote_edges : String = "INSERT INTO t VALUES ('a'''';b', \"a\"\";b\")"
+    assert(kept_sql(S.parse("1_quotes.sql", quote_edges ++ "; -- end"), quote_edges), "doubled quote boundaries changed")
+    +cast : String = "INSERT INTO t VALUES (1::bigint)"
+    assert(kept_sql(S.parse("1_cast.sql", cast), cast), "double colon cast was treated as a parameter")
+    +block_edges : String = "INSERT/***/INTO t VALUES (1) /* /x **/"
+    assert(kept_sql(S.parse("1_blocks.sql", block_edges), block_edges), "block delimiter boundaries changed")
+    assert(rejected(S.Migration, S.parse("1_bad.sql", "INSERT INTO t VALUES ('a''")), "escaped quote does not close a literal")
+    assert(rejected(S.Migration, S.parse("1_bad.sql", "INSERT INTO t VALUES (1):")), "trailing colon must be rejected")
+    assert(rejected(S.Migration, S.parse("1_bad.sql", "INSERT INTO t VALUES (1) -- comment\r")), "trailing CR in a line comment must be rejected")
+    assert(rejected(S.Migration, S.parse("1_bad.sql", "INSERT INTO t VALUES (1) /* /* nested */")), "nested block must be rejected")
+    assert(rejected(S.Migration, S.parse("1_bad.sql", "INSERT INTO t VALUES (1) /* open*")), "pending block close must be rejected")
+    assert(rejected(S.Migration, S.parse("1_bad.sql", "INSERT INTO t VALUES ('" ++ SCon{Chr{0}, "')"})), "NUL inside a quoted token must be rejected")
     assert(kept_sql(S.parse("1_bom.sql", SCon{Chr{65279}, rename}), rename), "UTF-8 BOM before the first statement")
     assert(rejected(S.Migration, S.parse("001_bad.sql", "COMMIT;")), "transaction control must be rejected")
     assert(rejected(S.Migration, S.parse("001_bad.sql", "INSERT INTO t VALUES (1); /* separator */ COMMIT")), "a supported statement hid a transaction command")
     assert(rejected(S.Migration, S.parse("001_bad.sql", "CREATE UNIQUE thing")), "expected UNIQUE INDEX")
     assert(rejected(S.Migration, S.parse("001_bad.sql", "CREATE TABLE_2 x")), "expected a complete TABLE keyword")
+    assert(rejected(S.Migration, S.parse("001_bad.sql", "CREATE TEMPORARY_TABLE x")), "expected a complete TEMPORARY keyword")
+    assert(rejected(S.Migration, S.parse("001_bad.sql", "CREATE TEMP INDEX x ON t(id)")), "temporary modifier requires table or view")
+    assert(rejected(S.Migration, S.parse("001_bad.sql", "CREATE VIEW \"odd;\"\"name\" AS SELECT ';''literal'; COMMIT")), "quoted view names cannot hide transaction commands")
     assert(rejected(S.Migration, S.parse("001_bad.sql", "INSERT INTO t VALUES (:p)")), "unbound migration parameter")
     assert(kept_sql(S.parse("004294967295_last.sql", rename), rename), "maximum migration version with leading zeros")
     assert(rejected(S.Migration, S.parse("4294967296_large.sql", "DROP TABLE x")), "version overflow")
     assert(rejected(S.Migration, S.parse("1x_malformed.sql", "DROP TABLE x")), "non-decimal migration version")
     assert(rejected(S.Migration, S.parse("000_zero.sql", "DROP TABLE x")), "zero migration version")
     assert(rejected(S.Migration, S.parse("1_empty.sql", "/* empty */")), "empty migration")
+    history_tests()
     args : List<String> <- IO.args()
     run(args)

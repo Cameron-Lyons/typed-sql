@@ -1,0 +1,1 @@
+INSERT INTO integration_categories DEFAULT VALUES RETURNING *;

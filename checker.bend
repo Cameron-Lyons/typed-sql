@@ -102,19 +102,22 @@ def projection_sql(p: Projection, +sqlite: Bool) -> L.Tokens:
     case col <> t: projected_sql(col, sqlite) <> projection_sql(t, sqlite)
 
 type Plan is Data:
-  Plan{head: L.Tokens, projection: Projection, tail: L.Tokens, params: M.Fields}
+  Plan{head: L.Tokens, projection: Projection, tail: L.Tokens, params: M.Fields, bounds: L.Tokens}
 
 def statement(+head: L.Tokens, projection: Projection, tail: L.Tokens, +params: M.Fields, +sqlite: Bool) -> String:
   match projection:
     case Nil{}: B.sql(head, params, sqlite)
     case h <> t:
+      +slots = B.index_slots(params, sqlite, 1, MTip{})
       columns = String.join(projection_sql(h <> t, sqlite), ", ")
-      String.trim_end(B.sql(head, params, sqlite) ++ " " ++ columns ++ " " ++ B.sql(tail, params, sqlite))
+      first = String.join(B.sql_tokens(head, slots), " ")
+      last = String.join(B.sql_tokens(tail, slots), " ")
+      String.trim_end(first ++ " " ++ columns ++ " " ++ last)
 
 def checked(name: String, plan: Plan) -> M.Query:
-  Plan{+head, +projection, +tail, +params} = plan
+  Plan{+head, +projection, +tail, +params, bounds} = plan
   M.Query{name, statement(head, projection, tail, params, True{}),
-    statement(head, projection, tail, params, False{}), params, names(projection)}
+    statement(head, projection, tail, params, False{}), params, names(projection), bounds}
 
 def order_nulls(ts: L.Tokens, +direction: String) -> M.Checked(String):
   match ts:
@@ -166,6 +169,10 @@ def ordering(ts: L.Tokens, found: Bool, table: String, fs: M.Fields, aliases: Al
 
 def page_value(ts: L.Tokens) -> M.Checked(String):
   match ts:
+    case SCon{Chr{58}, +name} <> Nil{}:
+      do M.Checked<String>:
+        S.require(L.identifier(name), "invalid pagination parameter: " ++ name)
+        return ":" ++ name
     case "+" <> +n <> Nil{}:
       do M.Checked<String>:
         S.require(B.integer_literal(n, False{}), "expected nonnegative integer in LIMIT or OFFSET")
@@ -193,37 +200,63 @@ def pagination(ts: L.Tokens, found: Bool) -> M.Checked(L.Tokens):
     case False{}: Done{Nil{}}
     case True{}: page_bounds(L.split_at(ts, "offset", Nil{}))
 
-def select_order(split: L.Split, page: L.Tokens, columns: Columns, +table: String, +fs: M.Fields) -> M.Checked(Plan):
-  L.Split{+conditions, sort, has_sort} = split
-  Columns{cols, aliases} = columns
-  do M.Checked<Plan>:
-    params : M.Fields <- B.where_tail(conditions, fs, Nil{})
-    ordered : L.Tokens <- ordering(sort, has_sort, table, fs, aliases)
-    tail : L.Tokens = List.append(&2, String, conditions, List.append(&2, String, ordered, page))
-    return Plan{["select"], cols, "from" <> table <> tail, params}
+type Pagination is Data:
+  Pagination{params: M.Fields, bounds: L.Tokens}
 
-def select_limit(split: L.Split, columns: Columns, table: String, fs: M.Fields) -> M.Checked(Plan):
+def page_bindings(ts: L.Tokens, params: M.Fields, bounds: L.Tokens) -> M.Checked(Pagination):
+  match ts:
+    case Nil{}: Done{Pagination{params, List.reverse(&2, String, bounds)}}
+    case SCon{Chr{58}, +name} <> rest:
+      do M.Checked<Pagination>:
+        next : M.Fields <- B.parameter(params, name, M.SqlInt{}, False{})
+        page_bindings(rest, next, name <> bounds)
+    case _ <> rest: page_bindings(rest, params, bounds)
+
+def source_fields(cols: Projection) -> M.Fields:
+  match cols:
+    case Nil{}: Nil{}
+    case Projected{source, M.Field{_, kind, null}} <> rest:
+      M.Field{source, kind, null} <> source_fields(rest)
+
+def select_plan(cols: Projection, table: String, tail: L.Tokens, bound: Pagination, distinct: Bool) -> Plan:
+  Pagination{params, bounds} = bound
+  head = Bool.pick(L.Tokens, distinct, ["select", "distinct"], ["select"])
+  Plan{head, cols, "from" <> table <> tail, params, bounds}
+
+def select_order(split: L.Split, +page: L.Tokens, columns: Columns, +table: String, +fs: M.Fields, +distinct: Bool) -> M.Checked(Plan):
+  L.Split{+conditions, sort, has_sort} = split
+  Columns{+cols, aliases} = columns
+  # PostgreSQL requires DISTINCT ordering to name a projected expression.
+  order_fields = Bool.pick(M.Fields, distinct, source_fields(cols), fs)
+  do M.Checked<Plan>:
+    filters : M.Fields <- B.where_tail(conditions, fs, Nil{})
+    bound : Pagination <- page_bindings(page, filters, Nil{})
+    ordered : L.Tokens <- ordering(sort, has_sort, table, order_fields, aliases)
+    tail : L.Tokens = List.append(&2, String, conditions, List.append(&2, String, ordered, page))
+    return select_plan(cols, table, tail, bound, distinct)
+
+def select_limit(split: L.Split, columns: Columns, table: String, fs: M.Fields, distinct: Bool) -> M.Checked(Plan):
   L.Split{filtered, values, found} = split
   do M.Checked<Plan>:
     page : L.Tokens <- pagination(values, found)
-    select_order(L.split_at(filtered, "order", Nil{}), page, columns, table, fs)
+    select_order(L.split_at(filtered, "order", Nil{}), page, columns, table, fs, distinct)
 
-def select_parts(split: L.Split, tables: M.Schema) -> M.Checked(Plan):
+def select_parts(split: L.Split, tables: M.Schema, distinct: Bool) -> M.Checked(Plan):
   match split:
     case L.Split{projections, +table <> rest, True{}}:
       do M.Checked<Plan>:
         +fs : M.Fields <- S.find_table(tables, table)
         cols : Columns <- project(projections, fs)
-        select_limit(L.split_at(rest, "limit", Nil{}), cols, table, fs)
+        select_limit(L.split_at(rest, "limit", Nil{}), cols, table, fs, distinct)
     case _: Fail{"expected SELECT columns FROM table"}
 
 def returning_plan(core: L.Tokens, columns: Columns, params: M.Fields) -> Plan:
   Columns{cols, _} = columns
-  Plan{List.append(&2, String, core, ["returning"]), cols, Nil{}, params}
+  Plan{List.append(&2, String, core, ["returning"]), cols, Nil{}, params, Nil{}}
 
 def wrote(+core: L.Tokens, returning: L.Tokens, found: Bool, fs: M.Fields, params: M.Fields) -> M.Checked(Plan):
   match found:
-    case False{}: Done{Plan{core, Nil{}, Nil{}, params}}
+    case False{}: Done{Plan{core, Nil{}, Nil{}, params, Nil{}}}
     case True{}:
       do M.Checked<Plan>:
         cols : Columns <- project(returning, fs)
@@ -254,65 +287,142 @@ def update_parts(split: L.Split, +fs: M.Fields) -> M.Checked(M.Fields):
         params : M.Fields <- assignments(L.chunks(sets, ","), fs, Nil{}, Nil{})
         B.where_tail(Bool.pick(L.Tokens, found, "where" <> rest, Nil{}), fs, params)
 
-def required_present(fs: M.Fields, +seen: M.Fields) -> M.Checked(Unit):
+def required_present(fs: M.Fields, +seen: M.Fields, +defaults: L.Tokens) -> M.Checked(Unit):
   match fs:
     case Nil{}: Done{Unit{}}
     case M.Field{+name, _, null} <> t:
       do M.Checked<Unit>:
-        S.require(null || S.has_field(seen, name), "missing required INSERT column: " ++ name)
-        required_present(t, seen)
+        S.require(null || S.has_field(seen, name) || List.contains(~String, ~String.eq, defaults, name), "missing required INSERT column: " ++ name)
+        required_present(t, seen, defaults)
 
-def inserted(cols: L.Groups, vals: L.Groups, +fs: M.Fields, +seen: M.Fields, params: M.Fields) -> M.Checked(M.Fields):
-  match cols vals:
-    case Nil{} Nil{}:
-      do M.Checked<M.Fields>:
-        required_present(fs, seen)
-        return params
-    case (+name <> Nil{}) <> ct value <> vt:
+# Resolve and validate the column list once, even for a large VALUES batch.
+def insert_columns(cols: L.Groups, +fs: M.Fields, +seen: M.Fields) -> M.Checked(M.Fields):
+  match cols:
+    case Nil{}: Done{List.reverse(&2, M.Field, seen)}
+    case [+name] <> rest:
       do M.Checked<M.Fields>:
         S.require(Bool.not(S.has_field(seen, name)), "duplicate INSERT column: " ++ name)
-        +f : M.Field <- S.lookup(fs, name)
+        f : M.Field <- S.lookup(fs, name)
+        insert_columns(rest, fs, f <> seen)
+    case _: Fail{"expected named INSERT columns"}
+
+def inserted(cols: M.Fields, vals: L.Groups, params: M.Fields) -> M.Checked(M.Fields):
+  match cols vals:
+    case Nil{} Nil{}: Done{params}
+    case f <> ct value <> vt:
+      do M.Checked<M.Fields>:
         next : M.Fields <- B.value(value, f, params)
-        inserted(ct, vt, fs, f <> seen, next)
+        inserted(ct, vt, next)
     case _ _: Fail{"INSERT needs one value for each named column"}
 
-def insert_values(reversed: L.Tokens, cols: L.Tokens, fs: M.Fields) -> M.Checked(M.Fields):
+def insert_values(reversed: L.Tokens, cols: M.Fields, params: M.Fields) -> M.Checked(M.Fields):
   match reversed:
-    case ")" <> body: inserted(L.chunks(cols, ","), L.chunks(List.reverse(&2, String, body), ","), fs, Nil{}, Nil{})
+    case ")" <> body: inserted(cols, L.chunks(List.reverse(&2, String, body), ","), params)
     case _: Fail{"expected closing ) in VALUES"}
 
-def insert_parts(split: L.Split, fs: M.Fields) -> M.Checked(M.Fields):
+def insert_rows(rows: L.Groups, +cols: M.Fields, params: M.Fields) -> M.Checked(M.Fields):
+  match rows:
+    case Nil{}: Done{params}
+    case ("(" <> body) <> rest:
+      do M.Checked<M.Fields>:
+        next : M.Fields <- insert_values(List.reverse(&2, String, body), cols, params)
+        insert_rows(rest, cols, next)
+    case _: Fail{"expected parenthesized VALUES row"}
+
+def insert_parts(split: L.Split, +fs: M.Fields, defaults: L.Tokens) -> M.Checked(M.Fields):
   match split:
-    case L.Split{cols, "values" <> "(" <> rest, True{}}: insert_values(List.reverse(&2, String, rest), cols, fs)
+    case L.Split{cols, "values" <> rest, True{}}:
+      do M.Checked<M.Fields>:
+        +fields : M.Fields <- insert_columns(L.chunks(cols, ","), fs, Nil{})
+        required_present(fs, fields, defaults)
+        rows : L.Groups <- L.balanced_chunks(rest, ",")
+        insert_rows(rows, fields, Nil{})
     case _: Fail{"expected INSERT INTO table (columns) VALUES (values)"}
+
+def insert_tail(ts: L.Tokens, +fs: M.Fields, defaults: L.Tokens) -> M.Checked(M.Fields):
+  match ts:
+    case "(" <> rest: insert_parts(L.split_at(rest, ")", Nil{}), fs, defaults)
+    case [first, second]:
+      do M.Checked<M.Fields>:
+        S.require(String.eq(first, "default") && String.eq(second, "values"), "expected DEFAULT VALUES")
+        required_present(fs, Nil{}, defaults)
+        return Nil{}
+    case _: Fail{"expected INSERT column list or DEFAULT VALUES"}
+
+def write_insert(core: L.Tokens, rest: L.Tokens, returning: L.Tokens, found: Bool, +tables: M.Schema) -> M.Checked(Plan):
+  match rest:
+    case into <> +table <> tail:
+      do M.Checked<Plan>:
+        S.require(String.eq(into, "into"), "expected INSERT INTO")
+        +fs : M.Fields <- S.find_table(tables, table)
+        defaults : L.Tokens <- S.default_columns(tables, table)
+        params : M.Fields <- insert_tail(tail, fs, defaults)
+        wrote(core, returning, found, fs, params)
+    case _: Fail{"expected INSERT INTO table"}
+
+def write_update(core: L.Tokens, rest: L.Tokens, returning: L.Tokens, found: Bool, tables: M.Schema) -> M.Checked(Plan):
+  match rest:
+    case table <> keyword <> tail:
+      do M.Checked<Plan>:
+        S.require(String.eq(keyword, "set"), "expected SET after UPDATE table")
+        +fs : M.Fields <- S.find_table(tables, table)
+        params : M.Fields <- update_parts(L.split_at(tail, "where", Nil{}), fs)
+        wrote(core, returning, found, fs, params)
+    case _: Fail{"expected UPDATE table SET"}
+
+def write_delete(core: L.Tokens, rest: L.Tokens, returning: L.Tokens, found: Bool, tables: M.Schema) -> M.Checked(Plan):
+  match rest:
+    case keyword <> table <> tail:
+      do M.Checked<Plan>:
+        S.require(String.eq(keyword, "from"), "expected DELETE FROM")
+        +fs : M.Fields <- S.find_table(tables, table)
+        params : M.Fields <- B.where_tail(tail, fs, Nil{})
+        wrote(core, returning, found, fs, params)
+    case _: Fail{"expected DELETE FROM table"}
+
+def write_kind(kind: Nat, core: L.Tokens, rest: L.Tokens, returning: L.Tokens, found: Bool, tables: M.Schema) -> M.Checked(Plan):
+  match kind:
+    case 1n: write_insert(core, rest, returning, found, tables)
+    case 2n: write_update(core, rest, returning, found, tables)
+    case 3n: write_delete(core, rest, returning, found, tables)
+    case _: Fail{"expected SELECT, INSERT, UPDATE, or DELETE"}
 
 def write_parts(+core: L.Tokens, returning: L.Tokens, found: Bool, tables: M.Schema) -> M.Checked(Plan):
   match core:
-    case "insert" <> "into" <> table <> "(" <> rest:
-      do M.Checked<Plan>:
-        +fs : M.Fields <- S.find_table(tables, table)
-        params : M.Fields <- insert_parts(L.split_at(rest, ")", Nil{}), fs)
-        wrote(core, returning, found, fs, params)
-    case "update" <> table <> "set" <> rest:
-      do M.Checked<Plan>:
-        +fs : M.Fields <- S.find_table(tables, table)
-        params : M.Fields <- update_parts(L.split_at(rest, "where", Nil{}), fs)
-        wrote(core, returning, found, fs, params)
-    case "delete" <> "from" <> table <> rest:
-      do M.Checked<Plan>:
-        +fs : M.Fields <- S.find_table(tables, table)
-        params : M.Fields <- B.where_tail(rest, fs, Nil{})
-        wrote(core, returning, found, fs, params)
-    case _: Fail{"expected SELECT, INSERT, UPDATE, or DELETE"}
+    case +command <> +rest:
+      kind = Bool.pick(Nat, String.eq(command, "insert"), 1n,
+        Bool.pick(Nat, String.eq(command, "update"), 2n,
+          Bool.pick(Nat, String.eq(command, "delete"), 3n, 0n)))
+      write_kind(kind, core, rest, returning, found, tables)
+    case Nil{}: Fail{"expected SELECT, INSERT, UPDATE, or DELETE"}
 
 def writes(split: L.Split, tables: M.Schema) -> M.Checked(Plan):
   L.Split{core, cols, found} = split
   write_parts(core, cols, found, tables)
 
-def plan(ts: L.Tokens, tables: M.Schema) -> M.Checked(Plan):
+def select_modifier(kind: Nat, projections: L.Tokens, rest: L.Tokens, tables: M.Schema) -> M.Checked(Plan):
+  match kind:
+    case 1n: select_parts(L.split_at(rest, "from", Nil{}), tables, True{})
+    case 2n: select_parts(L.split_at(rest, "from", Nil{}), tables, False{})
+    case _: select_parts(L.split_at(projections, "from", Nil{}), tables, False{})
+
+def select_tokens(+ts: L.Tokens, tables: M.Schema) -> M.Checked(Plan):
   match ts:
-    case "select" <> rest: select_parts(L.split_at(rest, "from", Nil{}), tables)
-    case _: writes(L.split_at(ts, "returning", Nil{}), tables)
+    case +first <> rest:
+      kind = Bool.pick(Nat, String.eq(first, "distinct"), 1n,
+        Bool.pick(Nat, String.eq(first, "all"), 2n, 0n))
+      select_modifier(kind, ts, rest, tables)
+    case Nil{}: Fail{"expected SELECT columns FROM table"}
+
+def plan_kind(select: Bool, ts: L.Tokens, rest: L.Tokens, tables: M.Schema) -> M.Checked(Plan):
+  match select:
+    case True{}: select_tokens(rest, tables)
+    case False{}: writes(L.split_at(ts, "returning", Nil{}), tables)
+
+def plan(+ts: L.Tokens, tables: M.Schema) -> M.Checked(Plan):
+  match ts:
+    case command <> rest: plan_kind(String.eq(command, "select"), ts, rest, tables)
+    case Nil{}: Fail{"expected SELECT, INSERT, UPDATE, or DELETE"}
 
 def single(groups: L.Groups) -> M.Checked(L.Tokens):
   match groups:
@@ -320,12 +430,19 @@ def single(groups: L.Groups) -> M.Checked(L.Tokens):
     case ts <> Nil{} <> Nil{}: Done{ts}
     case _: Fail{"expected exactly one SQL query"}
 
+def finalize_plan(plan: Plan) -> M.Checked(Plan):
+  Plan{head, projection, tail, uses, bounds} = plan
+  do M.Checked<Plan>:
+    params : M.Fields <- B.finalize_parameters(uses)
+    return Plan{head, projection, tail, params, bounds}
+
 def analyze(tables: M.Schema, +name: String, sql: String) -> M.Checked(Plan):
   do M.Checked<Plan>:
     S.require(L.identifier(name), "invalid query name: " ++ name)
     tokens : L.Tokens <- L.tokenize(sql)
     ts : L.Tokens <- single(L.chunks(tokens, ";"))
-    plan(ts, tables)
+    raw : Plan <- plan(ts, tables)
+    finalize_plan(raw)
 
 def query(tables: M.Schema, +name: String, sql: String) -> M.Checked(M.Query):
   do M.Checked<M.Query>:

@@ -15,6 +15,11 @@ def integer_is(result: D.Checked(D.I64), want: String) -> Bool:
 def roundtrip(+text: String) -> Bool:
   integer_is(D.read_int(text), text)
 
+def nonnegative(result: D.Checked(D.I64)) -> Bool:
+  match result:
+    case Done{value}: D.nonnegative(value)
+    case Fail{_}: False{}
+
 def rejected(-A: Data, result: D.Checked(A)) -> Bool:
   match result:
     case Done{_}: False{}
@@ -55,6 +60,7 @@ def decoded_batch(result: D.Checked(List<&2, String>), n: Nat) -> Bool:
 def main() -> IO(Unit):
   do IO<Unit>:
     check(roundtrip("-9223372036854775808") && roundtrip("9223372036854775807") && roundtrip("0"), "signed 64-bit endpoints")
+    check(nonnegative(D.read_int("0")) && nonnegative(D.read_int("9223372036854775807")) && Bool.not(nonnegative(D.read_int("-1"))) && Bool.not(nonnegative(D.read_int("-9223372036854775808"))), "pagination bound signs")
     check(rejected(D.I64, D.read_int("-9223372036854775809")) && rejected(D.I64, D.read_int("9223372036854775808")), "integer overflow")
     check(rejected(D.I64, D.read_int("12x")) && rejected(D.I64, D.read_int("")), "malformed integer")
     check(bool_is(D.read_bool("0"), False{}) && bool_is(D.read_bool("1"), True{}), "SQLite booleans")

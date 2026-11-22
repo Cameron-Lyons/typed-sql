@@ -49,27 +49,33 @@ def first_word(s: String) -> String:
 def after_word(s: String, word: String) -> String:
   skip_trivia(String.drop(s, String.length(word)), Plain{})
 
-def create_allowed(kind: String, s: String) -> Bool:
+def table_or_view(+s: String) -> Bool:
+  String.eq(s, "TABLE") || String.eq(s, "VIEW")
+
+def create_allowed(+kind: String, +s: String) -> Bool:
+  table_or_view(kind) || String.eq(kind, "INDEX") ||
+    (String.eq(kind, "UNIQUE") && String.eq(first_word(after_word(s, "UNIQUE")), "INDEX")) ||
+    ((String.eq(kind, "TEMP") || String.eq(kind, "TEMPORARY")) && table_or_view(first_word(after_word(s, kind))))
+
+def table_index_or_view(+s: String) -> Bool:
+  table_or_view(s) || String.eq(s, "INDEX")
+
+def statement_kind(+first: String) -> U32:
+  Bool.pick(U32, String.eq(first, "CREATE"), 1,
+    Bool.pick(U32, String.eq(first, "ALTER") || String.eq(first, "DROP"), 2,
+      Bool.pick(U32, String.eq(first, "INSERT") || String.eq(first, "UPDATE") || String.eq(first, "DELETE"), 3, 0)))
+
+def allowed_kind(kind: U32, first: String, s: String) -> Bool:
   match kind:
-    case "TABLE": True{}
-    case "INDEX": True{}
-    case "UNIQUE": String.eq(first_word(after_word(s, "UNIQUE")), "INDEX")
-    case _: False{}
-
-def table_or_index(+s: String) -> Bool:
-  String.eq(s, "TABLE") || String.eq(s, "INDEX")
-
-def allowed(first: String, +s: String) -> Bool:
-  match first:
-    case "CREATE":
-      +tail = after_word(s, "CREATE")
+    case 1:
+      +tail = after_word(s, first)
       create_allowed(first_word(tail), tail)
-    case "ALTER": table_or_index(first_word(after_word(s, "ALTER")))
-    case "DROP": table_or_index(first_word(after_word(s, "DROP")))
-    case "INSERT": True{}
-    case "UPDATE": True{}
-    case "DELETE": True{}
+    case 2: table_index_or_view(first_word(after_word(s, first)))
+    case 3: True{}
     case _: False{}
+
+def allowed(+first: String, s: String) -> Bool:
+  allowed_kind(statement_kind(first), first, s)
 
 def admit(sql: String, acc: Strings) -> M.Checked(Strings):
   match sql:
@@ -84,46 +90,150 @@ def admit(sql: String, acc: Strings) -> M.Checked(Strings):
 def finish_stmt(buf: String, acc: Strings) -> M.Checked(Strings):
   admit(skip_trivia(String.reverse(String.trim_start(buf)), Plain{}), acc)
 
-# A single- or double-quoted token uses SQL doubled quotes.
-def split_go(s: String, mode: Mode, buf: String, acc: Strings) -> M.Checked(Strings):
-  match s mode:
-    case SNil{} InQuote{_}: Fail{"unterminated quoted token in migration"}
-    case SNil{} BlockComment{}: Fail{"unterminated block comment in migration"}
-    case SNil{} _:
-      do M.Checked<Strings>:
-        stmts : Strings <- finish_stmt(buf, acc)
-        return List.reverse(&2, String, stmts)
-    case SCon{Chr{0}, _} _: Fail{"NUL in migration"}
-    case SCon{Chr{10}, t} LineComment{}: split_go(t, Plain{}, SCon{Chr{10}, buf}, acc)
-    case SCon{Chr{13}, SCon{Chr{10}, t}} LineComment{}: split_go(t, Plain{}, SCon{Chr{10}, SCon{Chr{13}, buf}}, acc)
-    case SCon{Chr{13}, _} LineComment{}: Fail{"use LF or CRLF to end a SQL line comment"}
-    case SCon{c, t} LineComment{}: split_go(t, LineComment{}, SCon{c, buf}, acc)
-    case SCon{Chr{42}, SCon{Chr{47}, t}} BlockComment{}: split_go(t, Plain{}, SCon{Chr{47}, SCon{Chr{42}, buf}}, acc)
-    case SCon{Chr{47}, SCon{Chr{42}, _}} BlockComment{}: Fail{"nested block comments are unsupported"}
-    case SCon{c, t} BlockComment{}: split_go(t, BlockComment{}, SCon{c, buf}, acc)
-    case SCon{Chr{39}, SCon{Chr{39}, t}} InQuote{39}:
-      split_go(t, InQuote{39}, SCon{Chr{39}, SCon{Chr{39}, buf}}, acc)
-    case SCon{Chr{34}, SCon{Chr{34}, t}} InQuote{34}:
-      split_go(t, InQuote{34}, SCon{Chr{34}, SCon{Chr{34}, buf}}, acc)
-    case SCon{Chr{92}, _} InQuote{39}: Fail{"backslash escapes in migration literals are unsupported"}
-    case SCon{Chr{+c}, t} InQuote{+q}:
-      split_go(t, Bool.pick(Mode, U32.is_eq(c, q), Plain{}, InQuote{q}), SCon{Chr{c}, buf}, acc)
-    case SCon{Chr{45}, SCon{Chr{45}, t}} Plain{}: split_go(t, LineComment{}, SCon{Chr{45}, SCon{Chr{45}, buf}}, acc)
-    case SCon{Chr{47}, SCon{Chr{42}, t}} Plain{}: split_go(t, BlockComment{}, SCon{Chr{42}, SCon{Chr{47}, buf}}, acc)
-    case SCon{Chr{39}, t} Plain{}: split_go(t, InQuote{39}, SCon{Chr{39}, buf}, acc)
-    case SCon{Chr{34}, t} Plain{}: split_go(t, InQuote{34}, SCon{Chr{34}, buf}, acc)
-    case SCon{Chr{59}, t} Plain{}:
-      do M.Checked<Strings>:
+# Split one character per step. Pending delimiters stay in the state, avoiding
+# the compiler expansion from matching deep source strings against every mode.
+type ScanMode is Data:
+  SqlPlain{}
+  Prefix{code: U32}
+  Quoted{delimiter: U32}
+  QuoteEnd{delimiter: U32}
+  SqlLine{}
+  SqlLineCR{}
+  SqlBlock{}
+  SqlBlockSlash{}
+  SqlBlockStar{}
+
+type ScriptState is Data:
+  ScriptState{mode: ScanMode, reversed: String, statements: Strings}
+
+def keep(mode: ScanMode, c: Char, buf: String, acc: Strings) -> M.Checked(ScriptState):
+  Done{ScriptState{mode, SCon{c, buf}, acc}}
+
+def plain_code(code: U32, c: Char, buf: String, acc: Strings) -> M.Checked(ScriptState):
+  match code:
+    case 45: keep(Prefix{45}, c, buf, acc)
+    case 47: keep(Prefix{47}, c, buf, acc)
+    case 58: keep(Prefix{58}, c, buf, acc)
+    case 39: keep(Quoted{39}, c, buf, acc)
+    case 34: keep(Quoted{34}, c, buf, acc)
+    case 59:
+      do M.Checked<ScriptState>:
         next : Strings <- finish_stmt(buf, acc)
-        split_go(t, Plain{}, "", next)
-    case SCon{Chr{58}, SCon{Chr{58}, t}} Plain{}: split_go(t, Plain{}, SCon{Chr{58}, SCon{Chr{58}, buf}}, acc)
-    case SCon{Chr{58}, _} Plain{}: Fail{"parameters are unsupported in migrations"}
-    case SCon{Chr{63}, _} Plain{}: Fail{"parameters are unsupported in migrations"}
-    case SCon{Chr{64}, _} Plain{}: Fail{"parameters are unsupported in migrations"}
-    case SCon{Chr{36}, _} Plain{}: Fail{"dollar quoting and parameters are unsupported in migrations"}
-    case SCon{Chr{91}, _} Plain{}: Fail{"use double quotes for migration identifiers"}
-    case SCon{Chr{96}, _} Plain{}: Fail{"use double quotes for migration identifiers"}
-    case SCon{c, t} Plain{}: split_go(t, Plain{}, SCon{c, buf}, acc)
+        return ScriptState{SqlPlain{}, "", next}
+    case 63: Fail{"parameters are unsupported in migrations"}
+    case 64: Fail{"parameters are unsupported in migrations"}
+    case 36: Fail{"dollar quoting and parameters are unsupported in migrations"}
+    case 91: Fail{"use double quotes for migration identifiers"}
+    case 96: Fail{"use double quotes for migration identifiers"}
+    case _: keep(SqlPlain{}, c, buf, acc)
+
+def plain_char(+c: Char, buf: String, acc: Strings) -> M.Checked(ScriptState):
+  plain_code(Char.to_u32(c), c, buf, acc)
+
+def prefix_pair(paired: Bool, mode: ScanMode, c: Char, buf: String, acc: Strings) -> M.Checked(ScriptState):
+  match paired:
+    case True{}: keep(mode, c, buf, acc)
+    case False{}: plain_char(c, buf, acc)
+
+def colon_pair(paired: Bool, c: Char, buf: String, acc: Strings) -> M.Checked(ScriptState):
+  match paired:
+    case True{}: keep(SqlPlain{}, c, buf, acc)
+    case False{}: Fail{"parameters are unsupported in migrations"}
+
+def prefix_char(code: U32, +c: Char, buf: String, acc: Strings) -> M.Checked(ScriptState):
+  match code:
+    case 45: prefix_pair(Char.is_eq(c, '-'), SqlLine{}, c, buf, acc)
+    case 47: prefix_pair(Char.is_eq(c, '*'), SqlBlock{}, c, buf, acc)
+    case _: colon_pair(Char.is_eq(c, ':'), c, buf, acc)
+
+def quoted_char(+delimiter: U32, +c: Char, buf: String, acc: Strings) -> M.Checked(ScriptState):
+  do M.Checked<ScriptState>:
+    require(Bool.not(U32.is_eq(delimiter, 39) && Char.is_eq(c, Chr{92})), "backslash escapes in migration literals are unsupported")
+    keep(Bool.pick(ScanMode, U32.is_eq(Char.to_u32(c), delimiter), QuoteEnd{delimiter}, Quoted{delimiter}), c, buf, acc)
+
+def quote_end(doubled: Bool, delimiter: U32, c: Char, buf: String, acc: Strings) -> M.Checked(ScriptState):
+  match doubled:
+    case True{}: keep(Quoted{delimiter}, c, buf, acc)
+    case False{}: plain_char(c, buf, acc)
+
+def line_char(+c: Char, buf: String, acc: Strings) -> M.Checked(ScriptState):
+  mode = Bool.pick(ScanMode, Char.is_eq(c, Chr{10}), SqlPlain{},
+    Bool.pick(ScanMode, Char.is_eq(c, Chr{13}), SqlLineCR{}, SqlLine{}))
+  keep(mode, c, buf, acc)
+
+def line_cr(newline: Bool, c: Char, buf: String, acc: Strings) -> M.Checked(ScriptState):
+  match newline:
+    case True{}: keep(SqlPlain{}, c, buf, acc)
+    case False{}: Fail{"use LF or CRLF to end a SQL line comment"}
+
+def block_char(+c: Char, buf: String, acc: Strings) -> M.Checked(ScriptState):
+  mode = Bool.pick(ScanMode, Char.is_eq(c, '*'), SqlBlockStar{},
+    Bool.pick(ScanMode, Char.is_eq(c, '/'), SqlBlockSlash{}, SqlBlock{}))
+  keep(mode, c, buf, acc)
+
+def block_slash(nested: Bool, c: Char, buf: String, acc: Strings) -> M.Checked(ScriptState):
+  match nested:
+    case True{}: Fail{"nested block comments are unsupported"}
+    case False{}: block_char(c, buf, acc)
+
+def block_star(closed: Bool, c: Char, buf: String, acc: Strings) -> M.Checked(ScriptState):
+  match closed:
+    case True{}: keep(SqlPlain{}, c, buf, acc)
+    case False{}: block_char(c, buf, acc)
+
+def split_step(mode: ScanMode, +c: Char, buf: String, acc: Strings) -> M.Checked(ScriptState):
+  match mode:
+    case SqlPlain{}: plain_char(c, buf, acc)
+    case Prefix{code}: prefix_char(code, c, buf, acc)
+    case Quoted{q}: quoted_char(q, c, buf, acc)
+    case QuoteEnd{+q}: quote_end(U32.is_eq(Char.to_u32(c), q), q, c, buf, acc)
+    case SqlLine{}: line_char(c, buf, acc)
+    case SqlLineCR{}: line_cr(Char.is_eq(c, Chr{10}), c, buf, acc)
+    case SqlBlock{}: block_char(c, buf, acc)
+    case SqlBlockSlash{}: block_slash(Char.is_eq(c, '*'), c, buf, acc)
+    case SqlBlockStar{}: block_star(Char.is_eq(c, '/'), c, buf, acc)
+
+def split_nonzero(nul: Bool, c: Char, state: ScriptState) -> M.Checked(ScriptState):
+  match nul:
+    case True{}: Fail{"NUL in migration"}
+    case False{}:
+      ScriptState{mode, buf, acc} = state
+      split_step(mode, c, buf, acc)
+
+def end_state(mode: ScanMode) -> M.Checked(Unit):
+  match mode:
+    case Quoted{_}: Fail{"unterminated quoted token in migration"}
+    case SqlBlock{}: Fail{"unterminated block comment in migration"}
+    case SqlBlockSlash{}: Fail{"unterminated block comment in migration"}
+    case SqlBlockStar{}: Fail{"unterminated block comment in migration"}
+    case SqlLineCR{}: Fail{"use LF or CRLF to end a SQL line comment"}
+    case Prefix{58}: Fail{"parameters are unsupported in migrations"}
+    case _: Done{Unit{}}
+
+def split_finish(state: ScriptState) -> M.Checked(Strings):
+  ScriptState{mode, buf, acc} = state
+  do M.Checked<Strings>:
+    end_state(mode)
+    stmts : Strings <- finish_stmt(buf, acc)
+    return List.reverse(&2, String, stmts)
+
+def split_chars(s: String, state: ScriptState) -> M.Checked(Strings):
+  match s:
+    case SNil{}: split_finish(state)
+    case SCon{+c, tail}:
+      do M.Checked<Strings>:
+        next : ScriptState <- split_nonzero(Char.is_eq(c, Chr{0}), c, state)
+        split_chars(tail, next)
+
+def scan_mode(mode: Mode) -> ScanMode:
+  match mode:
+    case Plain{}: SqlPlain{}
+    case InQuote{q}: Quoted{q}
+    case LineComment{}: SqlLine{}
+    case BlockComment{}: SqlBlock{}
+
+def split_go(s: String, mode: Mode, buf: String, acc: Strings) -> M.Checked(Strings):
+  split_chars(s, ScriptState{scan_mode(mode), buf, acc})
 
 def version(parsed: Maybe<&2, U32>) -> M.Checked(U32):
   match parsed:
