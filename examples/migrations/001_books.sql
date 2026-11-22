@@ -1,0 +1,6 @@
+CREATE TABLE books (
+  id BIGINT PRIMARY KEY NOT NULL,
+  title TEXT NOT NULL UNIQUE,
+  author TEXT,
+  in_print BOOLEAN NOT NULL
+);
